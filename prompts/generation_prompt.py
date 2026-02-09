@@ -216,45 +216,6 @@ FOR CHEMISTRY CONTENT:
 5. Develop questions that describe compounds or reactions in indirect, puzzle-like ways
 6. Generate questions that require understanding relationships between different chemical concepts
 
-FOR MANOBIK GUNABOLI (HUMAN QUALITIES/ETHICS) CONTENT:
-1. Focus on medical ethics, professional conduct, and human values
-2. Create scenario-based questions that present real-life situations
-3. Include questions about doctor-patient relationships and medical professionalism
-4. Cover essential human qualities such as:
-   - সহানুভূতি (Empathy)
-   - সততা (Honesty)
-   - ন্যায়বিচার (Justice)
-   - গোপনীয়তা রক্ষা (Confidentiality)
-   - দায়িত্বশীলতা (Responsibility)
-   - উদারতা (Generosity)
-   - আত্মনিয়ন্ত্রণ (Self-control)
-   - সাহস (Courage)
-   - শৃঙ্খলা (Discipline)
-   - সহিষ্ণুতা (Patience)
-
-5. Question Format for Manobik Gunaboli:
-   - Start with a realistic scenario or situation
-   - Present the scenario in Bengali with proper context
-   - Ask "এটি কোন মানবিক গুণাবলির উদাহরণ?" or similar questions
-   - Provide 4 options with different human qualities
-   - Ensure the correct answer clearly matches the scenario
-
-6. Example Question Structure:
-   "একজন চিকিৎসক রোগীর সঙ্গে সহানুভূতিশীল আচরণ করছেন, তার কথা মনোযোগ দিয়ে শুনছেন এবং মানসিক সাপোর্ট দিচ্ছেন। এটি কোন মানবিক গুণাবলির উদাহরণ?"
-   Options: A. সততা B. সহানুভূতি C. ন্যায়বিচার D. আত্মনিয়ন্ত্রণ
-
-7. Create diverse scenarios including:
-   - Doctor-patient interactions
-   - Medical confidentiality situations
-   - Professional responsibility cases
-   - Ethical dilemmas in healthcare
-   - Compassionate care examples
-   - Professional conduct scenarios
-
-8. Ensure scenarios are realistic and educationally valuable
-9. Make questions test understanding of ethical principles, not just memorization
-10. Include both positive examples (good qualities) and challenging situations (ethical dilemmas)
-
 AVOIDING COMMON MISTAKES:
 1. DO NOT rely on general knowledge that might contradict the textbook content
 2. Carefully distinguish between similar concepts (e.g., mitosis vs. meiosis)
@@ -301,8 +262,5 @@ CRITICAL REQUIREMENTS:
 - TRIPLE-CHECK every correct answer against the original image content
 - Ensure all answer options are scientifically valid (even incorrect options should be plausible)
 - Make the correct answer unambiguously right based on the textbook's information
-- Generate explanations for ALL questions using the exact format specified above
-- For manobik gunaboli content, create realistic medical scenarios that test ethical understanding
-- Include diverse human qualities and ethical principles in manobik gunaboli questions
 
 Return complete, valid JSON that can be parsed without modification.""" 
