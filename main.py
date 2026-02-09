@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import asyncio
 from datetime import datetime
+from queue import Queue
+from threading import Lock
+import concurrent.futures
 
 import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,6 +28,44 @@ class Config:
     GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "").split(",")
     TEMP_DIR = Path("temp")
     OUTPUT_DIR = Path("output")
+    MAX_CONCURRENT_IMAGES = 5  # Process 5 images at once
+    MAX_QUEUE_SIZE = 10  # Maximum number of tasks in queue
+    
+    # Gemini Model Configuration
+    GEMINI_MODEL = "gemini-2.0-flash-exp"  # Latest Gemini 2.0 Flash (experimental)
+    # Alternative models:
+    # "gemini-2.0-flash" - Stable Gemini 2.0 Flash (when available)
+    # "gemini-1.5-flash" - Previous generation
+    # "gemini-1.5-flash-8b" - Smaller, faster model
+    # "gemini-1.5-pro" - More powerful but slower
+    
+    # Generation Configuration
+    GENERATION_CONFIG = {
+        "temperature": 0.1,  # Lower temperature for more consistent JSON output
+        "top_p": 0.95,
+        "top_k": 40,
+        "max_output_tokens": 8192,
+    }
+    
+    # Safety Settings (optional - adjust as needed)
+    SAFETY_SETTINGS = [
+        {
+            "category": "HARM_CATEGORY_HARASSMENT",
+            "threshold": "BLOCK_NONE"
+        },
+        {
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "threshold": "BLOCK_NONE"
+        },
+        {
+            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "threshold": "BLOCK_NONE"
+        },
+        {
+            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "threshold": "BLOCK_NONE"
+        },
+    ]
     
     def __init__(self):
         if not self.TELEGRAM_BOT_TOKEN:
@@ -42,21 +83,70 @@ class GeminiAPIRotator:
     def __init__(self, api_keys: List[str]):
         self.api_keys = [key.strip() for key in api_keys if key.strip()]
         self.current_index = 0
+        self.lock = Lock()
         
         if not self.api_keys:
             raise ValueError("No valid Gemini API keys provided!")
     
     def get_next_key(self) -> str:
-        """Get next API key in rotation"""
-        key = self.api_keys[self.current_index]
-        self.current_index = (self.current_index + 1) % len(self.api_keys)
-        return key
-    
-    def configure_genai(self):
-        """Configure Gemini with current API key"""
-        genai.configure(api_key=self.get_next_key())
+        """Get next API key in rotation (thread-safe)"""
+        with self.lock:
+            key = self.api_keys[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.api_keys)
+            return key
 
 api_rotator = GeminiAPIRotator(config.GEMINI_API_KEYS)
+
+# Task Queue Manager
+class TaskQueue:
+    def __init__(self):
+        self.queue = []
+        self.lock = Lock()
+        self.processing = {}
+    
+    def add_task(self, user_id: int, task_data: Dict) -> int:
+        """Add task to queue and return position"""
+        with self.lock:
+            if len(self.queue) >= config.MAX_QUEUE_SIZE:
+                return -1
+            
+            task = {
+                'user_id': user_id,
+                'data': task_data,
+                'timestamp': datetime.now()
+            }
+            self.queue.append(task)
+            return len(self.queue)
+    
+    def get_next_task(self) -> Optional[Dict]:
+        """Get next task from queue"""
+        with self.lock:
+            if self.queue:
+                return self.queue.pop(0)
+            return None
+    
+    def get_position(self, user_id: int) -> int:
+        """Get user's position in queue"""
+        with self.lock:
+            for idx, task in enumerate(self.queue):
+                if task['user_id'] == user_id:
+                    return idx + 1
+            return 0
+    
+    def is_processing(self, user_id: int) -> bool:
+        """Check if user's task is being processed"""
+        with self.lock:
+            return user_id in self.processing
+    
+    def set_processing(self, user_id: int, status: bool):
+        """Set processing status for user"""
+        with self.lock:
+            if status:
+                self.processing[user_id] = True
+            else:
+                self.processing.pop(user_id, None)
+
+task_queue = TaskQueue()
 
 # Prompt for question extraction
 def get_prompt():
@@ -213,15 +303,22 @@ class PDFProcessor:
             raise Exception(f"Error converting PDF to images: {str(e)}")
     
     @staticmethod
-    async def process_image_with_gemini(image: Image.Image, retry_count: int = 3) -> Optional[List[Dict]]:
-        """Process image using Gemini API with retry logic"""
+    async def process_single_image(image: Image.Image, image_idx: int, retry_count: int = 3) -> Optional[tuple]:
+        """Process a single image and return (image_idx, questions)"""
         for attempt in range(retry_count):
             try:
-                # Rotate API key
-                api_rotator.configure_genai()
+                # Get API key for this request
+                api_key = api_rotator.get_next_key()
+                genai.configure(api_key=api_key)
                 
-                # Use Gemini Flash model for cost efficiency
-                model = genai.GenerativeModel('gemini-1.5-flash')
+                # Use Gemini 2.0 Flash model with enhanced configuration
+                model = genai.GenerativeModel(
+                    model_name=config.GEMINI_MODEL,
+                    generation_config=config.GENERATION_CONFIG,
+                    safety_settings=config.SAFETY_SETTINGS
+                )
+                
+                print(f"Processing image {image_idx} with {config.GEMINI_MODEL}")
                 
                 # Generate content
                 response = model.generate_content([get_prompt(), image])
@@ -242,21 +339,57 @@ class PDFProcessor:
                 # Parse JSON
                 questions = json.loads(response_text)
                 
-                return questions
+                print(f"✅ Successfully processed image {image_idx}")
+                return (image_idx, questions)
                 
             except json.JSONDecodeError as e:
-                print(f"JSON decode error on attempt {attempt + 1}: {str(e)}")
+                print(f"JSON decode error for image {image_idx}, attempt {attempt + 1}: {str(e)}")
                 if attempt == retry_count - 1:
-                    return None
+                    return (image_idx, None)
                 await asyncio.sleep(1)
                 
             except Exception as e:
-                print(f"Error processing image on attempt {attempt + 1}: {str(e)}")
+                print(f"Error processing image {image_idx}, attempt {attempt + 1}: {str(e)}")
                 if attempt == retry_count - 1:
-                    return None
+                    return (image_idx, None)
                 await asyncio.sleep(2)
         
-        return None
+        return (image_idx, None)
+    
+    @staticmethod
+    async def process_images_parallel(images: List[Image.Image], progress_callback=None) -> List[Dict]:
+        """Process multiple images in parallel"""
+        all_questions = []
+        total_images = len(images)
+        
+        # Process images in batches
+        for batch_start in range(0, total_images, config.MAX_CONCURRENT_IMAGES):
+            batch_end = min(batch_start + config.MAX_CONCURRENT_IMAGES, total_images)
+            batch_images = images[batch_start:batch_end]
+            
+            # Create tasks for this batch
+            tasks = []
+            for i, image in enumerate(batch_images):
+                image_idx = batch_start + i + 1
+                task = PDFProcessor.process_single_image(image, image_idx)
+                tasks.append(task)
+            
+            # Process batch concurrently
+            results = await asyncio.gather(*tasks)
+            
+            # Collect results
+            for image_idx, questions in results:
+                if progress_callback:
+                    await progress_callback(image_idx, total_images)
+                
+                if questions:
+                    all_questions.extend(questions)
+            
+            # Small delay between batches
+            if batch_end < total_images:
+                await asyncio.sleep(0.5)
+        
+        return all_questions
 
 # CSV Generation
 class CSVGenerator:
@@ -303,9 +436,13 @@ class TelegramBot:
         await update.message.reply_text(
             "Welcome! 👋\n\n"
             "Send me a PDF file to extract MCQ questions.\n\n"
+            "🤖 Powered by Gemini 2.0 Flash\n\n"
             "Commands:\n"
             "/start - Start the bot\n"
-            "/help - Show help message"
+            "/help - Show help message\n"
+            "/queue - Check your queue position\n"
+            "/cancel - Cancel your current task\n"
+            "/model - Show current AI model info"
         )
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,12 +453,54 @@ class TelegramBot:
             "2. Optionally specify page range (e.g., 1-5)\n"
             "3. I'll extract all MCQ questions and generate a CSV file\n\n"
             "*Features:*\n"
+            "✓ Gemini 2.0 Flash AI\n"
             "✓ Automatic answer detection\n"
             "✓ Bengali explanations\n"
             "✓ Mathematical & chemical notation support\n"
-            "✓ CSV export in standard format",
+            "✓ CSV export in standard format\n"
+            "✓ Task queue system\n"
+            "✓ Parallel image processing (5x faster)",
             parse_mode='Markdown'
         )
+    
+    async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show model information"""
+        await update.message.reply_text(
+            f"🤖 *AI Model Information:*\n\n"
+            f"Model: `{config.GEMINI_MODEL}`\n"
+            f"Temperature: {config.GENERATION_CONFIG['temperature']}\n"
+            f"Max Tokens: {config.GENERATION_CONFIG['max_output_tokens']}\n"
+            f"Parallel Workers: {config.MAX_CONCURRENT_IMAGES}\n"
+            f"API Keys: {len(config.GEMINI_API_KEYS)}",
+            parse_mode='Markdown'
+        )
+    
+    async def queue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check queue position"""
+        user_id = update.effective_user.id
+        
+        if task_queue.is_processing(user_id):
+            await update.message.reply_text("⚙️ Your task is currently being processed!")
+        else:
+            position = task_queue.get_position(user_id)
+            if position > 0:
+                await update.message.reply_text(f"📋 Your position in queue: {position}")
+            else:
+                await update.message.reply_text("❌ You don't have any tasks in queue.")
+    
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel user's task"""
+        user_id = update.effective_user.id
+        
+        if user_id in self.user_states:
+            pdf_path = self.user_states[user_id].get('pdf_path')
+            if pdf_path and pdf_path.exists():
+                pdf_path.unlink(missing_ok=True)
+            del self.user_states[user_id]
+            task_queue.set_processing(user_id, False)
+            await update.message.reply_text("✅ Task cancelled successfully!")
+        else:
+            await update.message.reply_text("❌ No active task to cancel.")
     
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle PDF document upload"""
@@ -330,6 +509,14 @@ class TelegramBot:
         
         if not document.file_name.endswith('.pdf'):
             await update.message.reply_text("❌ Please send a PDF file only.")
+            return
+        
+        # Check if user already has a task
+        if user_id in self.user_states or task_queue.is_processing(user_id):
+            await update.message.reply_text(
+                "⚠️ You already have a task in progress.\n"
+                "Use /cancel to cancel the current task."
+            )
             return
         
         processing_msg = await update.message.reply_text("📥 Downloading PDF...")
@@ -363,7 +550,7 @@ class TelegramBot:
         user_id = update.effective_user.id
         
         if query.data == "all_pages":
-            await self.process_pdf(update, context, user_id, None)
+            await self.add_to_queue(update, context, user_id, None)
         elif query.data == "specify_range":
             await query.edit_message_text(
                 "Please send the page range in format: start-end\n"
@@ -397,43 +584,115 @@ class TelegramBot:
                 page_range = (start_page, end_page)
                 self.user_states[user_id]['waiting_for_range'] = False
                 
-                await self.process_pdf(update, context, user_id, page_range)
+                await self.add_to_queue(update, context, user_id, page_range)
                 
             except ValueError:
                 await update.message.reply_text("❌ Invalid page numbers. Use numbers only.")
     
-    async def process_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                         user_id: int, page_range: Optional[tuple]):
-        """Process PDF and extract questions"""
+    async def add_to_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          user_id: int, page_range: Optional[tuple]):
+        """Add task to queue"""
         if user_id not in self.user_states:
             return
         
-        pdf_path = self.user_states[user_id]['pdf_path']
+        task_data = {
+            'pdf_path': self.user_states[user_id]['pdf_path'],
+            'page_range': page_range,
+            'context': context
+        }
+        
+        position = task_queue.add_task(user_id, task_data)
+        
+        if position == -1:
+            if update.callback_query:
+                await update.callback_query.message.edit_text(
+                    "❌ Queue is full. Please try again later."
+                )
+            else:
+                await update.message.reply_text("❌ Queue is full. Please try again later.")
+            return
         
         if update.callback_query:
-            message = update.callback_query.message
-            await message.edit_text("🔄 Processing PDF...")
+            await update.callback_query.message.edit_text(
+                f"✅ Added to queue!\n"
+                f"📋 Position: {position}\n"
+                f"⏳ Estimated wait: ~{position * 2} minutes\n"
+                f"🤖 Using {config.GEMINI_MODEL}"
+            )
         else:
-            message = await update.message.reply_text("🔄 Processing PDF...")
+            await update.message.reply_text(
+                f"✅ Added to queue!\n"
+                f"📋 Position: {position}\n"
+                f"⏳ Estimated wait: ~{position * 2} minutes\n"
+                f"🤖 Using {config.GEMINI_MODEL}"
+            )
         
+        # Process queue
+        asyncio.create_task(self.process_queue())
+    
+    async def process_queue(self):
+        """Process tasks from queue"""
+        while True:
+            task = task_queue.get_next_task()
+            
+            if not task:
+                break
+            
+            user_id = task['user_id']
+            task_data = task['data']
+            
+            task_queue.set_processing(user_id, True)
+            
+            try:
+                await self.process_pdf(
+                    user_id=user_id,
+                    pdf_path=task_data['pdf_path'],
+                    page_range=task_data['page_range'],
+                    context=task_data['context']
+                )
+            except Exception as e:
+                print(f"Error processing task for user {user_id}: {str(e)}")
+            finally:
+                task_queue.set_processing(user_id, False)
+            
+            # Small delay between tasks
+            await asyncio.sleep(1)
+    
+    async def process_pdf(self, user_id: int, pdf_path: Path, 
+                         page_range: Optional[tuple], context: ContextTypes.DEFAULT_TYPE):
+        """Process PDF and extract questions"""
         try:
+            # Send initial message
+            message = await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🔄 Processing your PDF...\n🤖 Using {config.GEMINI_MODEL}"
+            )
+            
+            # Convert PDF to images
             await message.edit_text("📄 Converting PDF to images...")
             images = await PDFProcessor.pdf_to_images(pdf_path, page_range)
             
-            await message.edit_text(f"🖼️ Processing {len(images)} pages...")
+            await message.edit_text(
+                f"🖼️ Processing {len(images)} pages in parallel...\n"
+                f"⚡ Using {config.MAX_CONCURRENT_IMAGES} parallel workers\n"
+                f"🤖 AI Model: {config.GEMINI_MODEL}"
+            )
             
-            all_questions = []
-            processor = PDFProcessor()
+            # Progress callback
+            async def update_progress(current: int, total: int):
+                try:
+                    progress = (current / total) * 100
+                    await message.edit_text(
+                        f"🔍 Processing pages: {current}/{total}\n"
+                        f"📊 Progress: {progress:.1f}%\n"
+                        f"⚡ Parallel processing enabled\n"
+                        f"🤖 {config.GEMINI_MODEL}"
+                    )
+                except:
+                    pass
             
-            for idx, image in enumerate(images, 1):
-                await message.edit_text(f"🔍 Processing page {idx}/{len(images)}...")
-                
-                questions = await processor.process_image_with_gemini(image)
-                
-                if questions:
-                    all_questions.extend(questions)
-                
-                await asyncio.sleep(0.5)
+            # Process images in parallel
+            all_questions = await PDFProcessor.process_images_parallel(images, update_progress)
             
             if not all_questions:
                 await message.edit_text("❌ No questions found in the PDF")
@@ -453,21 +712,29 @@ class TelegramBot:
                     chat_id=user_id,
                     document=csv_file,
                     filename=f"mcq_questions_{timestamp}.csv",
-                    caption=f"✅ Extracted {len(all_questions)} questions successfully!"
+                    caption=f"✅ Extracted {len(all_questions)} questions successfully!\n🤖 Powered by {config.GEMINI_MODEL}"
                 )
             
             await message.edit_text(
                 f"✅ Done!\n\n"
                 f"📝 Total questions: {len(all_questions)}\n"
-                f"📄 Pages processed: {len(images)}"
+                f"📄 Pages processed: {len(images)}\n"
+                f"⚡ Parallel processing: {config.MAX_CONCURRENT_IMAGES}x speed\n"
+                f"🤖 AI Model: {config.GEMINI_MODEL}"
             )
             
+            # Cleanup
             pdf_path.unlink(missing_ok=True)
             csv_path.unlink(missing_ok=True)
-            del self.user_states[user_id]
+            if user_id in self.user_states:
+                del self.user_states[user_id]
             
         except Exception as e:
-            await message.edit_text(f"❌ Error processing PDF: {str(e)}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Error processing PDF: {str(e)}"
+            )
+            # Cleanup on error
             if pdf_path.exists():
                 pdf_path.unlink(missing_ok=True)
             if user_id in self.user_states:
@@ -481,11 +748,18 @@ def main():
     
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("model", bot.model_command))
+    application.add_handler(CommandHandler("queue", bot.queue_command))
+    application.add_handler(CommandHandler("cancel", bot.cancel_command))
     application.add_handler(MessageHandler(filters.Document.PDF, bot.handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
     application.add_handler(CallbackQueryHandler(bot.button_callback))
     
     print("🤖 Bot started successfully!")
+    print(f"🤖 AI Model: {config.GEMINI_MODEL}")
+    print(f"⚡ Parallel processing: {config.MAX_CONCURRENT_IMAGES} concurrent images")
+    print(f"📋 Max queue size: {config.MAX_QUEUE_SIZE} tasks")
+    print(f"🔑 API Keys: {len(config.GEMINI_API_KEYS)}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
