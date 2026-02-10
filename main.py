@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 import asyncio
 from datetime import datetime
 from threading import Lock
+import io
 
 import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -20,29 +21,25 @@ from telegram.ext import (
 from telegram.error import RetryAfter, TimedOut
 from pdf2image import convert_from_path
 from PIL import Image
+from pymongo import MongoClient
+from bson import ObjectId
 
 from prompts import get_extraction_prompt, get_generation_prompt
 
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "").split(",")
-    QUIZ_MARKER = os.getenv("QUIZ_MARKER", "[TSS]")  # Marker before question
-    EXPLANATION_TAG = os.getenv("EXPLANATION_TAG", "t.me/tss")  # Tag at end of explanation
-    
+    MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
     TEMP_DIR = Path("temp")
     OUTPUT_DIR = Path("output")
     MAX_CONCURRENT_IMAGES = 5
     MAX_QUEUE_SIZE = 10
     GEMINI_MODEL = "gemini-2.5-flash"
-    
-    # Rate limiting configuration
-    POLL_DELAY = 3  # Delay between polls in seconds
-    BATCH_SIZE = 20  # Send polls in batches
-    BATCH_DELAY = 10  # Delay between batches in seconds
-    
+    POLL_DELAY = 3
+    BATCH_SIZE = 20
+    BATCH_DELAY = 10
     GENERATION_CONFIG = {"temperature": 0.1, "top_p": 0.95, "top_k": 40, "max_output_tokens": 8192}
     SAFETY_SETTINGS = [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}]
-    
     def __init__(self):
         if not self.TELEGRAM_BOT_TOKEN:
             raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required!")
@@ -52,6 +49,61 @@ class Config:
         self.OUTPUT_DIR.mkdir(exist_ok=True)
 
 config = Config()
+
+class MongoDB:
+    def __init__(self):
+        self.client = MongoClient(config.MONGODB_URI)
+        self.db = self.client['telegram_quiz_bot']
+        self.users = self.db['users']
+        self.channels = self.db['channels']
+        self.groups = self.db['groups']
+        print("✅ MongoDB connected")
+    
+    def get_user_settings(self, user_id: int) -> Dict:
+        user = self.users.find_one({'user_id': user_id})
+        if not user:
+            default_settings = {
+                'user_id': user_id,
+                'quiz_marker': os.getenv("QUIZ_MARKER", "[TSS]"),
+                'explanation_tag': os.getenv("EXPLANATION_TAG", "t.me/tss"),
+                'created_at': datetime.now()
+            }
+            self.users.insert_one(default_settings)
+            return default_settings
+        return user
+    
+    def update_user_settings(self, user_id: int, key: str, value: str):
+        self.users.update_one({'user_id': user_id}, {'$set': {key: value, 'updated_at': datetime.now()}}, upsert=True)
+    
+    def add_channel(self, user_id: int, channel_id: int, channel_name: str):
+        channel = {'user_id': user_id, 'channel_id': channel_id, 'channel_name': channel_name, 'type': 'channel', 'created_at': datetime.now()}
+        existing = self.channels.find_one({'user_id': user_id, 'channel_id': channel_id})
+        if existing:
+            self.channels.update_one({'_id': existing['_id']}, {'$set': {'channel_name': channel_name, 'updated_at': datetime.now()}})
+        else:
+            self.channels.insert_one(channel)
+    
+    def add_group(self, user_id: int, group_id: int, group_name: str):
+        group = {'user_id': user_id, 'group_id': group_id, 'group_name': group_name, 'type': 'group', 'created_at': datetime.now()}
+        existing = self.groups.find_one({'user_id': user_id, 'group_id': group_id})
+        if existing:
+            self.groups.update_one({'_id': existing['_id']}, {'$set': {'group_name': group_name, 'updated_at': datetime.now()}})
+        else:
+            self.groups.insert_one(group)
+    
+    def get_user_channels(self, user_id: int) -> List[Dict]:
+        return list(self.channels.find({'user_id': user_id}))
+    
+    def get_user_groups(self, user_id: int) -> List[Dict]:
+        return list(self.groups.find({'user_id': user_id}))
+    
+    def delete_channel(self, channel_doc_id: str):
+        self.channels.delete_one({'_id': ObjectId(channel_doc_id)})
+    
+    def delete_group(self, group_doc_id: str):
+        self.groups.delete_one({'_id': ObjectId(group_doc_id)})
+
+db = MongoDB()
 
 class GeminiAPIRotator:
     def __init__(self, api_keys: List[str]):
@@ -111,92 +163,84 @@ class TaskQueue:
 
 task_queue = TaskQueue()
 
+class CSVParser:
+    @staticmethod
+    def parse_csv_file(file_content: bytes) -> List[Dict]:
+        questions = []
+        try:
+            content = file_content.decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(content))
+            for row in csv_reader:
+                if not row.get('questions'):
+                    continue
+                options = []
+                for i in range(1, 5):
+                    option_key = f'option{i}'
+                    if option_key in row and row[option_key]:
+                        options.append(row[option_key])
+                if len(options) < 2:
+                    continue
+                try:
+                    answer_num = int(row.get('answer', '1'))
+                    correct_answer_index = answer_num - 1
+                    if correct_answer_index < 0 or correct_answer_index >= len(options):
+                        correct_answer_index = 0
+                except (ValueError, TypeError):
+                    correct_answer_index = 0
+                question = {'question_description': row.get('questions', '').strip(), 'options': options, 'correct_answer_index': correct_answer_index, 'correct_option': chr(65 + correct_answer_index), 'explanation': row.get('explanation', '').strip()}
+                questions.append(question)
+            return questions
+        except Exception as e:
+            print(f"Error parsing CSV: {str(e)}")
+            raise Exception(f"Failed to parse CSV file: {str(e)}")
+
 class QuizPoster:
-    """Handle posting quizzes to channels/groups with rate limiting"""
-    
     @staticmethod
-    def format_question(question_text: str) -> str:
-        """Format question with quiz marker and line break"""
-        # Add quiz marker before question with line break
-        formatted = f"{config.QUIZ_MARKER}\n\n{question_text}"
-        
-        # Telegram quiz question max length is 300 characters
+    def format_question(question_text: str, quiz_marker: str) -> str:
+        formatted = f"{quiz_marker}\n\n{question_text}"
         if len(formatted) > 300:
-            # Truncate if too long
-            max_question_len = 300 - len(config.QUIZ_MARKER) - 3  # -3 for "\n\n" and ellipsis
-            formatted = f"{config.QUIZ_MARKER}\n\n{question_text[:max_question_len-3]}..."
-        
+            max_question_len = 300 - len(quiz_marker) - 3
+            formatted = f"{quiz_marker}\n\n{question_text[:max_question_len-3]}..."
         return formatted
-    
     @staticmethod
-    def format_explanation(explanation: str) -> str:
-        """Format explanation with tag at the end"""
-        # Add explanation tag at the end
-        formatted = f"{explanation} [{config.EXPLANATION_TAG}]"
-        
-        # Telegram explanation max length is 200 characters
+    def format_explanation(explanation: str, explanation_tag: str) -> str:
+        if not explanation:
+            return None
+        formatted = f"{explanation} [{explanation_tag}]"
         if len(formatted) > 200:
-            # Truncate explanation but keep tag
-            tag_with_brackets = f" [{config.EXPLANATION_TAG}]"
-            max_explanation_len = 200 - len(tag_with_brackets) - 3  # -3 for ellipsis
+            tag_with_brackets = f" [{explanation_tag}]"
+            max_explanation_len = 200 - len(tag_with_brackets) - 3
             formatted = f"{explanation[:max_explanation_len]}...{tag_with_brackets}"
-        
         return formatted
-    
     @staticmethod
-    async def send_quiz_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: int, question: Dict, message_thread_id: Optional[int] = None, max_retries: int = 5) -> bool:
-        """Send a single quiz poll with retry logic for rate limiting"""
+    async def send_quiz_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: int, question: Dict, quiz_marker: str, explanation_tag: str, message_thread_id: Optional[int] = None, max_retries: int = 5) -> bool:
         for attempt in range(max_retries):
             try:
-                # Get question data
                 question_text = question.get('question_description', 'Question')
-                options = question.get('options', [])[:10]  # Telegram supports up to 10 options
+                options = question.get('options', [])[:10]
                 correct_option_id = question.get('correct_answer_index', 0)
                 explanation = question.get('explanation', '')
-                
-                # Ensure we have at least 2 options (Telegram requirement)
                 if len(options) < 2:
                     print(f"Skipping question with less than 2 options")
                     return False
-                
-                # Ensure correct_option_id is within valid range
                 if correct_option_id < 0 or correct_option_id >= len(options):
                     print(f"Invalid correct_option_id: {correct_option_id} for {len(options)} options")
                     correct_option_id = 0
-                
-                # Format question and explanation
-                formatted_question = QuizPoster.format_question(question_text)
-                formatted_explanation = QuizPoster.format_explanation(explanation) if explanation else None
-                
-                # Send quiz poll
-                await context.bot.send_poll(
-                    chat_id=chat_id,
-                    question=formatted_question,
-                    options=options,
-                    type='quiz',  # This makes it a quiz (not regular poll)
-                    correct_option_id=correct_option_id,
-                    explanation=formatted_explanation,
-                    is_anonymous=False,
-                    message_thread_id=message_thread_id
-                )
-                
+                formatted_question = QuizPoster.format_question(question_text, quiz_marker)
+                formatted_explanation = QuizPoster.format_explanation(explanation, explanation_tag) if explanation else None
+                await context.bot.send_poll(chat_id=chat_id, question=formatted_question, options=options, type='quiz', correct_option_id=correct_option_id, explanation=formatted_explanation, is_anonymous=False, message_thread_id=message_thread_id)
                 print(f"✅ Quiz sent successfully")
                 return True
-                
             except RetryAfter as e:
                 wait_time = e.retry_after + 2
                 print(f"⏳ Rate limited. Waiting {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
-                
             except TimedOut:
                 print(f"⏱️ Timeout on attempt {attempt + 1}, retrying...")
                 await asyncio.sleep(3)
-                
             except Exception as e:
                 error_msg = str(e)
                 print(f"❌ Error sending quiz (attempt {attempt + 1}): {error_msg}")
-                
-                # Check for specific errors
                 if "question is too long" in error_msg.lower():
                     print("Question too long, skipping...")
                     return False
@@ -206,63 +250,40 @@ class QuizPoster:
                 elif "chat not found" in error_msg.lower():
                     print("Chat not found or bot is not a member")
                     return False
-                
                 if attempt == max_retries - 1:
                     return False
-                    
                 await asyncio.sleep(3)
-        
         return False
-    
     @staticmethod
-    async def post_quizzes_batch(context: ContextTypes.DEFAULT_TYPE, chat_id: int, questions: List[Dict], message_thread_id: Optional[int] = None, progress_callback=None) -> Dict:
-        """Post quizzes in batches with rate limiting"""
+    async def post_quizzes_batch(context: ContextTypes.DEFAULT_TYPE, chat_id: int, questions: List[Dict], quiz_marker: str, explanation_tag: str, message_thread_id: Optional[int] = None, progress_callback=None) -> Dict:
         total = len(questions)
         success_count = 0
         failed_count = 0
         skipped_count = 0
-        
         for i in range(0, total, config.BATCH_SIZE):
             batch = questions[i:i + config.BATCH_SIZE]
             batch_num = (i // config.BATCH_SIZE) + 1
             total_batches = (total + config.BATCH_SIZE - 1) // config.BATCH_SIZE
-            
             print(f"📦 Processing batch {batch_num}/{total_batches}")
-            
             for idx, question in enumerate(batch):
                 global_idx = i + idx + 1
-                
                 if progress_callback:
                     await progress_callback(global_idx, total)
-                
-                # Check if question has valid data
                 if not question.get('question_description') or not question.get('options'):
                     print(f"⏭️ Skipping question {global_idx} - missing data")
                     skipped_count += 1
                     continue
-                
-                success = await QuizPoster.send_quiz_with_retry(context, chat_id, question, message_thread_id)
-                
+                success = await QuizPoster.send_quiz_with_retry(context, chat_id, question, quiz_marker, explanation_tag, message_thread_id)
                 if success:
                     success_count += 1
                 else:
                     failed_count += 1
-                
-                # Delay between individual polls
                 if global_idx < total:
                     await asyncio.sleep(config.POLL_DELAY)
-            
-            # Delay between batches
             if i + config.BATCH_SIZE < total:
                 print(f"✅ Batch {batch_num} completed. Waiting {config.BATCH_DELAY}s before next batch...")
                 await asyncio.sleep(config.BATCH_DELAY)
-        
-        return {
-            'total': total,
-            'success': success_count,
-            'failed': failed_count,
-            'skipped': skipped_count
-        }
+        return {'total': total, 'success': success_count, 'failed': failed_count, 'skipped': skipped_count}
 
 class ImageProcessor:
     @staticmethod
@@ -395,22 +416,67 @@ class TelegramBot:
     def __init__(self):
         self.user_states = {}
         self.queue_processor = None
-    
     async def post_init(self, application: Application):
         self.queue_processor = QueueProcessor(self)
         asyncio.create_task(self.queue_processor.start())
         print("✅ Queue processor initialized")
-    
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"Welcome! 👋\n\nSend me:\n📄 PDF file\n🖼️ Single image\n🖼️🖼️ Multiple images (as media group)\n\n🤖 Powered by Gemini 2.0 Flash\n📢 Quiz Marker: {config.QUIZ_MARKER}\n🔗 Explanation Tag: {config.EXPLANATION_TAG}\n\nCommands:\n/start - Start the bot\n/help - Show help message\n/queue - Check your queue position\n/cancel - Cancel your current task\n/model - Show current AI model info")
-    
+        user_id = update.effective_user.id
+        settings = db.get_user_settings(user_id)
+        await update.message.reply_text(f"Welcome! 👋\n\nSend me:\n📄 PDF file\n🖼️ Single image\n🖼️🖼️ Multiple images\n📊 CSV file (to post quizzes)\n\n🤖 Powered by Gemini 2.0 Flash\n📢 Quiz Marker: {settings['quiz_marker']}\n🔗 Explanation Tag: {settings['explanation_tag']}\n\nCommands:\n/start - Start the bot\n/help - Show help message\n/settings - Configure channels, groups & markers\n/info - Get chat information\n/queue - Check your queue position\n/cancel - Cancel your current task\n/model - Show current AI model info")
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📚 *How to use:*\n\n1. Send me content:\n   • PDF file (single or multiple pages)\n   • Single image\n   • Multiple images (select multiple)\n\n2. Choose mode:\n   • *Extraction* - Extract existing questions\n   • *Generation* - Generate new questions from textbook\n\n3. Optionally specify page range (PDF only)\n\n4. Get your CSV file\n\n5. Optionally post quizzes to channel/group\n\n*Quiz Format:*\n• Question: MARKER + question\n• Explanation: explanation + [TAG]\n\n*Features:*\n✓ Gemini 2.0 Flash AI\n✓ PDF, single & multiple image support\n✓ Two processing modes\n✓ Post to channels/groups\n✓ Topic support for groups\n✓ Rate limiting protection\n✓ Bengali explanations\n✓ Task queue system\n✓ Parallel processing (5x faster)", parse_mode='Markdown')
+        await update.message.reply_text("📚 *How to use:*\n\n*Generate Quizzes:*\n1. Send PDF/images\n2. Choose mode (Extraction/Generation)\n3. Get CSV file\n4. Post to saved channels/groups\n\n*Post from CSV:*\n1. Send CSV file\n2. Choose destination\n3. Quizzes posted automatically\n\n*Settings:*\nUse /settings to:\n• Add/remove channels\n• Add/remove groups\n• Change quiz marker\n• Change explanation tag\n\n*CSV Format:*\nquestions,option1,option2,option3,option4,option5,answer,explanation,type,section\n\n*Features:*\n✓ Gemini 2.0 Flash AI\n✓ PDF, images, CSV support\n✓ Multi-channel/group posting\n✓ Topic support for groups\n✓ Rate limiting protection\n✓ Bengali explanations", parse_mode='Markdown')
+    
+    async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        settings = db.get_user_settings(user_id)
+        channels = db.get_user_channels(user_id)
+        groups = db.get_user_groups(user_id)
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Channel", callback_data="settings_add_channel")],
+            [InlineKeyboardButton("➕ Add Group", callback_data="settings_add_group")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="settings_manage_channels")],
+            [InlineKeyboardButton("👥 Manage Groups", callback_data="settings_manage_groups")],
+            [InlineKeyboardButton("🏷️ Change Quiz Marker", callback_data="settings_change_marker")],
+            [InlineKeyboardButton("🔗 Change Explanation Tag", callback_data="settings_change_tag")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(f"⚙️ *Settings*\n\n📢 Quiz Marker: `{settings['quiz_marker']}`\n🔗 Explanation Tag: `{settings['explanation_tag']}`\n\n📺 Channels: {len(channels)}\n👥 Groups: {len(groups)}\n\nChoose an option:", reply_markup=reply_markup, parse_mode='Markdown')
+    
+    async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat
+        info_text = f"📊 *Chat Information*\n\n"
+        info_text += f"🆔 Chat ID: `{chat.id}`\n"
+        info_text += f"📛 Title: {chat.title or 'N/A'}\n"
+        info_text += f"📝 Type: {chat.type}\n"
+        info_text += f"👤 Username: @{chat.username or 'N/A'}\n"
+        if chat.description:
+            info_text += f"📄 Description: {chat.description[:100]}...\n"
+        try:
+            if chat.type in ['supergroup', 'group']:
+                chat_full = await context.bot.get_chat(chat.id)
+                info_text += f"\n🔧 *Additional Info:*\n"
+                if hasattr(chat_full, 'permissions'):
+                    info_text += f"✅ Can send polls: {chat_full.permissions.can_send_polls}\n"
+                if chat.type == 'supergroup':
+                    try:
+                        forums_enabled = chat_full.is_forum
+                        info_text += f"📑 Topics enabled: {forums_enabled}\n"
+                        if forums_enabled:
+                            info_text += f"\n💡 *Tip:* This group has topics enabled!\n"
+                            info_text += f"To get topic IDs:\n"
+                            info_text += f"1. Send a message in the desired topic\n"
+                            info_text += f"2. Forward it to @userinfobot\n"
+                            info_text += f"3. Look for 'message_thread_id'\n"
+                    except:
+                        pass
+        except Exception as e:
+            info_text += f"\n⚠️ Could not fetch additional info: {str(e)}\n"
+        await update.message.reply_text(info_text, parse_mode='Markdown')
     
     async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         queue_size = task_queue.get_queue_size()
-        await update.message.reply_text(f"🤖 *AI Model Information:*\n\nModel: `{config.GEMINI_MODEL}`\nTemperature: {config.GENERATION_CONFIG['temperature']}\nMax Tokens: {config.GENERATION_CONFIG['max_output_tokens']}\nParallel Workers: {config.MAX_CONCURRENT_IMAGES}\nAPI Keys: {len(config.GEMINI_API_KEYS)}\nQueue Size: {queue_size}/{config.MAX_QUEUE_SIZE}\n\n*Quiz Settings:*\nMarker: {config.QUIZ_MARKER}\nExplanation Tag: {config.EXPLANATION_TAG}\n\n*Rate Limiting:*\nPoll Delay: {config.POLL_DELAY}s\nBatch Size: {config.BATCH_SIZE}\nBatch Delay: {config.BATCH_DELAY}s", parse_mode='Markdown')
-    
+        await update.message.reply_text(f"🤖 *AI Model Information:*\n\nModel: `{config.GEMINI_MODEL}`\nTemperature: {config.GENERATION_CONFIG['temperature']}\nMax Tokens: {config.GENERATION_CONFIG['max_output_tokens']}\nParallel Workers: {config.MAX_CONCURRENT_IMAGES}\nAPI Keys: {len(config.GEMINI_API_KEYS)}\nQueue Size: {queue_size}/{config.MAX_QUEUE_SIZE}\n\n*Rate Limiting:*\nPoll Delay: {config.POLL_DELAY}s\nBatch Size: {config.BATCH_SIZE}\nBatch Delay: {config.BATCH_DELAY}s", parse_mode='Markdown')
     async def queue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if task_queue.is_processing(user_id):
@@ -421,7 +487,6 @@ class TelegramBot:
                 await update.message.reply_text(f"📋 Your position in queue: {position}\n⏳ Estimated wait: ~{position * 2} minutes")
             else:
                 await update.message.reply_text("❌ You don't have any tasks in queue.")
-    
     async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if user_id in self.user_states:
@@ -434,12 +499,14 @@ class TelegramBot:
             await update.message.reply_text("✅ Task cancelled successfully!")
         else:
             await update.message.reply_text("❌ No active task to cancel.")
-    
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         document = update.message.document
+        if document.file_name.endswith('.csv'):
+            await self.handle_csv(update, context)
+            return
         if not document.file_name.endswith('.pdf'):
-            await update.message.reply_text("❌ Please send a PDF file only.")
+            await update.message.reply_text("❌ Please send a PDF or CSV file only.")
             return
         if user_id in self.user_states or task_queue.is_processing(user_id):
             await update.message.reply_text("⚠️ You already have a task in progress.\nUse /cancel to cancel the current task.")
@@ -455,7 +522,31 @@ class TelegramBot:
             await processing_msg.edit_text("📄 PDF received!\n\nChoose processing mode:\n\n📤 *Extraction Mode*\nExtract existing MCQs from PDF\n\n✨ *Generation Mode*\nGenerate new MCQs from textbook content", reply_markup=reply_markup, parse_mode='Markdown')
         except Exception as e:
             await processing_msg.edit_text(f"❌ Error downloading PDF: {str(e)}")
-    
+    async def handle_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        document = update.message.document
+        if user_id in self.user_states or task_queue.is_processing(user_id):
+            await update.message.reply_text("⚠️ You already have a task in progress.\nUse /cancel to cancel the current task.")
+            return
+        processing_msg = await update.message.reply_text("📊 Processing CSV file...")
+        try:
+            file = await context.bot.get_file(document.file_id)
+            file_content = await file.download_as_bytearray()
+            await processing_msg.edit_text("📊 Parsing CSV questions...")
+            questions = CSVParser.parse_csv_file(bytes(file_content))
+            if not questions:
+                await processing_msg.edit_text("❌ No valid questions found in CSV file.\n\nMake sure your CSV has:\n• questions column\n• option1, option2, option3, option4 columns\n• answer column (1-4)\n• explanation column (optional)")
+                return
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_id = f"csv_{user_id}_{timestamp}"
+            settings = db.get_user_settings(user_id)
+            self.user_states[user_id] = {'questions': questions, 'session_id': session_id, 'source': 'csv'}
+            print(f"CSV processed - User: {user_id}, Session: {session_id}, Questions: {len(questions)}")
+            keyboard = [[InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await processing_msg.edit_text(f"✅ CSV Processed!\n\n📊 Total questions: {len(questions)}\n📢 Quiz Marker: {settings['quiz_marker']}\n🔗 Explanation Tag: {settings['explanation_tag']}\n\nReady to post quizzes!", reply_markup=reply_markup)
+        except Exception as e:
+            await processing_msg.edit_text(f"❌ Error processing CSV: {str(e)}\n\nMake sure your CSV follows the correct format.")
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if user_id in self.user_states or task_queue.is_processing(user_id):
@@ -483,7 +574,6 @@ class TelegramBot:
                 await processing_msg.edit_text("🖼️ Image received!\n\nChoose processing mode:\n\n📤 *Extraction Mode*\nExtract existing MCQs from image\n\n✨ *Generation Mode*\nGenerate new MCQs from textbook content", reply_markup=reply_markup, parse_mode='Markdown')
             except Exception as e:
                 await processing_msg.edit_text(f"❌ Error downloading image: {str(e)}")
-    
     async def process_media_group_delayed(self, user_id: int, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
         if user_id in self.user_states and self.user_states[user_id].get('waiting_for_more'):
@@ -497,9 +587,94 @@ class TelegramBot:
         query = update.callback_query
         await query.answer()
         user_id = update.effective_user.id
+        callback_data = query.data
+        print(f"Button clicked - User: {user_id}, Data: {callback_data}")
         
-        if query.data.startswith("mode_"):
-            mode = query.data.split("_")[1]
+        # Settings callbacks
+        if callback_data == "settings_add_channel":
+            await query.edit_message_text("📺 Please send the *Channel ID and Name* in format:\n\n`channel_id channel_name`\n\nExample: `-1001234567890 My Channel`\n\nYou can get the ID by forwarding a message from the channel to @userinfobot", parse_mode='Markdown')
+            self.user_states[user_id] = {'waiting_for': 'add_channel'}
+        
+        elif callback_data == "settings_add_group":
+            await query.edit_message_text("👥 Please send the *Group ID and Name* in format:\n\n`group_id group_name`\n\nExample: `-1001234567890 My Group`\n\nYou can get the ID by forwarding a message from the group to @userinfobot", parse_mode='Markdown')
+            self.user_states[user_id] = {'waiting_for': 'add_group'}
+        
+        elif callback_data == "settings_manage_channels":
+            channels = db.get_user_channels(user_id)
+            if not channels:
+                await query.edit_message_text("❌ No channels saved.\n\nUse /settings to add channels.")
+                return
+            keyboard = []
+            for ch in channels:
+                keyboard.append([InlineKeyboardButton(f"❌ {ch['channel_name']}", callback_data=f"del_ch_{str(ch['_id'])}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="settings_back")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("📺 *Manage Channels*\n\nClick to delete:", reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data == "settings_manage_groups":
+            groups = db.get_user_groups(user_id)
+            if not groups:
+                await query.edit_message_text("❌ No groups saved.\n\nUse /settings to add groups.")
+                return
+            keyboard = []
+            for gr in groups:
+                keyboard.append([InlineKeyboardButton(f"❌ {gr['group_name']}", callback_data=f"del_gr_{str(gr['_id'])}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="settings_back")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("👥 *Manage Groups*\n\nClick to delete:", reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data.startswith("del_ch_"):
+            channel_id = callback_data[7:]
+            db.delete_channel(channel_id)
+            await query.answer("✅ Channel deleted!")
+            channels = db.get_user_channels(user_id)
+            if not channels:
+                await query.edit_message_text("❌ No channels saved.\n\nUse /settings to add channels.")
+                return
+            keyboard = []
+            for ch in channels:
+                keyboard.append([InlineKeyboardButton(f"❌ {ch['channel_name']}", callback_data=f"del_ch_{str(ch['_id'])}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="settings_back")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("📺 *Manage Channels*\n\nClick to delete:", reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data.startswith("del_gr_"):
+            group_id = callback_data[7:]
+            db.delete_group(group_id)
+            await query.answer("✅ Group deleted!")
+            groups = db.get_user_groups(user_id)
+            if not groups:
+                await query.edit_message_text("❌ No groups saved.\n\nUse /settings to add groups.")
+                return
+            keyboard = []
+            for gr in groups:
+                keyboard.append([InlineKeyboardButton(f"❌ {gr['group_name']}", callback_data=f"del_gr_{str(gr['_id'])}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="settings_back")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("👥 *Manage Groups*\n\nClick to delete:", reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data == "settings_change_marker":
+            await query.edit_message_text("🏷️ Please send the new *Quiz Marker*\n\nExample: `[TSS]`\n\nCurrent: " + db.get_user_settings(user_id)['quiz_marker'], parse_mode='Markdown')
+            self.user_states[user_id] = {'waiting_for': 'change_marker'}
+        
+        elif callback_data == "settings_change_tag":
+            await query.edit_message_text("🔗 Please send the new *Explanation Tag*\n\nExample: `t.me/tss`\n\nCurrent: " + db.get_user_settings(user_id)['explanation_tag'], parse_mode='Markdown')
+            self.user_states[user_id] = {'waiting_for': 'change_tag'}
+        
+        elif callback_data == "settings_back":
+            settings = db.get_user_settings(user_id)
+            channels = db.get_user_channels(user_id)
+            groups = db.get_user_groups(user_id)
+            keyboard = [[InlineKeyboardButton("➕ Add Channel", callback_data="settings_add_channel")], [InlineKeyboardButton("➕ Add Group", callback_data="settings_add_group")], [InlineKeyboardButton("📺 Manage Channels", callback_data="settings_manage_channels")], [InlineKeyboardButton("👥 Manage Groups", callback_data="settings_manage_groups")], [InlineKeyboardButton("🏷️ Change Quiz Marker", callback_data="settings_change_marker")], [InlineKeyboardButton("🔗 Change Explanation Tag", callback_data="settings_change_tag")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(f"⚙️ *Settings*\n\n📢 Quiz Marker: `{settings['quiz_marker']}`\n🔗 Explanation Tag: `{settings['explanation_tag']}`\n\n📺 Channels: {len(channels)}\n👥 Groups: {len(groups)}\n\nChoose an option:", reply_markup=reply_markup, parse_mode='Markdown')
+        
+        # Mode selection
+        elif callback_data.startswith("mode_"):
+            mode = callback_data.split("_")[1]
+            if user_id not in self.user_states:
+                await query.edit_message_text("❌ Session expired. Please upload the file again.")
+                return
             self.user_states[user_id]['mode'] = mode
             mode_name = "Extraction" if mode == "extraction" else "Generation"
             if self.user_states[user_id]['content_type'] == 'pdf':
@@ -509,34 +684,122 @@ class TelegramBot:
             else:
                 await query.edit_message_text(f"✅ Mode selected: *{mode_name}*\n\nAdding to queue...", parse_mode='Markdown')
                 await self.add_to_queue_direct(user_id, None, context)
-        elif query.data == "all_pages":
+        
+        elif callback_data == "all_pages":
+            if user_id not in self.user_states:
+                await query.edit_message_text("❌ Session expired. Please upload the file again.")
+                return
             await self.add_to_queue_direct(user_id, None, context)
-        elif query.data == "specify_range":
+        
+        elif callback_data == "specify_range":
+            if user_id not in self.user_states:
+                await query.edit_message_text("❌ Session expired. Please upload the file again.")
+                return
             await query.edit_message_text("Please send the page range in format: start-end\nExample: 1-10 or 5-8")
             self.user_states[user_id]['waiting_for_range'] = True
-        elif query.data.startswith("post_quizzes_"):
-            session_id = query.data.split("_")[2]
-            if user_id in self.user_states and self.user_states[user_id].get('session_id') == session_id:
-                await query.edit_message_text("📢 *Post Quizzes*\n\nChoose destination:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📺 Channel", callback_data=f"dest_channel_{session_id}")], [InlineKeyboardButton("👥 Group", callback_data=f"dest_group_{session_id}")]]), parse_mode='Markdown')
-        elif query.data.startswith("dest_channel_"):
-            session_id = query.data.split("_")[2]
-            await query.edit_message_text("📺 Please send the *Channel ID*\n\nExample: -1001234567890\n\nYou can get this by forwarding a message from the channel to @userinfobot", parse_mode='Markdown')
-            self.user_states[user_id]['waiting_for'] = 'channel_id'
-            self.user_states[user_id]['session_id'] = session_id
-        elif query.data.startswith("dest_group_"):
-            session_id = query.data.split("_")[2]
-            await query.edit_message_text("👥 Please send the *Group ID*\n\nExample: -1001234567890\n\nYou can get this by forwarding a message from the group to @userinfobot", parse_mode='Markdown')
-            self.user_states[user_id]['waiting_for'] = 'group_id'
-            self.user_states[user_id]['session_id'] = session_id
+        
+        # Post quizzes
+        elif callback_data.startswith("post_"):
+            session_id = callback_data[5:]
+            print(f"Post button clicked - User: {user_id}, Session ID: {session_id}")
+            if user_id not in self.user_states:
+                print(f"User {user_id} not in user_states")
+                await query.edit_message_text("❌ Session expired. Please upload your file again.")
+                return
+            stored_session = self.user_states[user_id].get('session_id')
+            print(f"Stored session: {stored_session}, Requested: {session_id}")
+            if stored_session != session_id:
+                print(f"Session mismatch for user {user_id}")
+                await query.edit_message_text("❌ Session expired. Please try again.")
+                return
+            if 'questions' not in self.user_states[user_id]:
+                print(f"No questions for user {user_id}")
+                await query.edit_message_text("❌ No questions available. Please try again.")
+                return
+            print(f"Showing destination selection for user {user_id}")
+            channels = db.get_user_channels(user_id)
+            groups = db.get_user_groups(user_id)
+            if not channels and not groups:
+                await query.edit_message_text("❌ No channels or groups saved.\n\nUse /settings to add channels and groups first.")
+                return
+            keyboard = []
+            for ch in channels:
+                keyboard.append([InlineKeyboardButton(f"📺 {ch['channel_name']}", callback_data=f"dest_ch_{ch['channel_id']}_{session_id}")])
+            for gr in groups:
+                keyboard.append([InlineKeyboardButton(f"👥 {gr['group_name']}", callback_data=f"dest_gr_{gr['group_id']}_{session_id}")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("📢 *Post Quizzes*\n\nSelect destination:", reply_markup=reply_markup, parse_mode='Markdown')
+        
+        elif callback_data.startswith("dest_ch_"):
+            parts = callback_data.split("_")
+            channel_id = int(parts[2])
+            session_id = "_".join(parts[3:])
+            print(f"Channel selected - User: {user_id}, Channel: {channel_id}, Session: {session_id}")
+            if user_id not in self.user_states or self.user_states[user_id].get('session_id') != session_id:
+                await query.edit_message_text("❌ Session expired. Please try again.")
+                return
+            await query.edit_message_text("📺 Posting to channel...")
+            await self.post_quizzes_to_destination(user_id, channel_id, None, context, query.message)
+        
+        elif callback_data.startswith("dest_gr_"):
+            parts = callback_data.split("_")
+            group_id = int(parts[2])
+            session_id = "_".join(parts[3:])
+            print(f"Group selected - User: {user_id}, Group: {group_id}, Session: {session_id}")
+            if user_id not in self.user_states or self.user_states[user_id].get('session_id') != session_id:
+                await query.edit_message_text("❌ Session expired. Please try again.")
+                return
+            self.user_states[user_id]['selected_group'] = group_id
+            await query.edit_message_text("🔢 Please send the *Topic ID* (Message Thread ID)\n\nExample: 123\n\nIf the group doesn't have topics enabled, send 0", parse_mode='Markdown')
+            self.user_states[user_id]['waiting_for'] = 'topic_id'
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if user_id not in self.user_states:
             return
         waiting_for = self.user_states[user_id].get('waiting_for')
-        if self.user_states[user_id].get('waiting_for_range'):
+        text = update.message.text.strip()
+        
+        if waiting_for == 'add_channel':
             try:
-                text = update.message.text.strip()
+                parts = text.split(" ", 1)
+                if len(parts) < 2:
+                    await update.message.reply_text("❌ Invalid format. Use: `channel_id channel_name`", parse_mode='Markdown')
+                    return
+                channel_id = int(parts[0])
+                channel_name = parts[1]
+                db.add_channel(user_id, channel_id, channel_name)
+                await update.message.reply_text(f"✅ Channel added!\n\n📺 {channel_name}\n🆔 {channel_id}")
+                del self.user_states[user_id]
+            except ValueError:
+                await update.message.reply_text("❌ Invalid channel ID. Please use a valid number.")
+        
+        elif waiting_for == 'add_group':
+            try:
+                parts = text.split(" ", 1)
+                if len(parts) < 2:
+                    await update.message.reply_text("❌ Invalid format. Use: `group_id group_name`", parse_mode='Markdown')
+                    return
+                group_id = int(parts[0])
+                group_name = parts[1]
+                db.add_group(user_id, group_id, group_name)
+                await update.message.reply_text(f"✅ Group added!\n\n👥 {group_name}\n🆔 {group_id}")
+                del self.user_states[user_id]
+            except ValueError:
+                await update.message.reply_text("❌ Invalid group ID. Please use a valid number.")
+        
+        elif waiting_for == 'change_marker':
+            db.update_user_settings(user_id, 'quiz_marker', text)
+            await update.message.reply_text(f"✅ Quiz marker updated to: {text}")
+            del self.user_states[user_id]
+        
+        elif waiting_for == 'change_tag':
+            db.update_user_settings(user_id, 'explanation_tag', text)
+            await update.message.reply_text(f"✅ Explanation tag updated to: {text}")
+            del self.user_states[user_id]
+        
+        elif self.user_states[user_id].get('waiting_for_range'):
+            try:
                 parts = text.split('-')
                 if len(parts) != 2:
                     await update.message.reply_text("❌ Invalid format. Use: start-end (e.g., 1-10)")
@@ -551,29 +814,15 @@ class TelegramBot:
                 await self.add_to_queue_direct(user_id, page_range, context)
             except ValueError:
                 await update.message.reply_text("❌ Invalid page numbers. Use numbers only.")
-        elif waiting_for == 'channel_id':
-            try:
-                channel_id = int(update.message.text.strip())
-                self.user_states[user_id]['channel_id'] = channel_id
-                self.user_states[user_id]['waiting_for'] = None
-                await self.post_quizzes_to_destination(user_id, channel_id, None, context)
-            except ValueError:
-                await update.message.reply_text("❌ Invalid Channel ID. Please send a valid number.")
-        elif waiting_for == 'group_id':
-            try:
-                group_id = int(update.message.text.strip())
-                self.user_states[user_id]['group_id'] = group_id
-                self.user_states[user_id]['waiting_for'] = 'topic_id'
-                await update.message.reply_text("🔢 Please send the *Topic ID* (Message Thread ID)\n\nExample: 123\n\nIf the group doesn't have topics enabled, send 0", parse_mode='Markdown')
-            except ValueError:
-                await update.message.reply_text("❌ Invalid Group ID. Please send a valid number.")
+        
         elif waiting_for == 'topic_id':
             try:
-                topic_id = int(update.message.text.strip())
-                group_id = self.user_states[user_id]['group_id']
+                topic_id = int(text)
+                group_id = self.user_states[user_id]['selected_group']
                 self.user_states[user_id]['waiting_for'] = None
                 message_thread_id = topic_id if topic_id > 0 else None
-                await self.post_quizzes_to_destination(user_id, group_id, message_thread_id, context)
+                status_msg = await update.message.reply_text("👥 Posting to group...")
+                await self.post_quizzes_to_destination(user_id, group_id, message_thread_id, context, status_msg)
             except ValueError:
                 await update.message.reply_text("❌ Invalid Topic ID. Please send a valid number or 0.")
     
@@ -624,15 +873,17 @@ class TelegramBot:
                 return
             await message.edit_text(f"📊 Generating CSV with {len(all_questions)} questions...")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_id = f"{user_id}_{timestamp}"
+            session_id = f"gen_{user_id}_{timestamp}"
             csv_path = config.OUTPUT_DIR / f"questions_{mode}_{session_id}.csv"
             CSVGenerator.questions_to_csv(all_questions, csv_path)
-            self.user_states[user_id] = {'questions': all_questions, 'session_id': session_id, 'csv_path': csv_path}
+            settings = db.get_user_settings(user_id)
+            self.user_states[user_id] = {'questions': all_questions, 'session_id': session_id, 'csv_path': csv_path, 'source': 'generated'}
+            print(f"Content processed - User: {user_id}, Session: {session_id}, Questions: {len(all_questions)}")
             await message.edit_text("✅ Sending CSV file...")
-            keyboard = [[InlineKeyboardButton("📢 Post Quizzes to Channel/Group", callback_data=f"post_quizzes_{session_id}")]]
+            keyboard = [[InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             with open(csv_path, 'rb') as csv_file:
-                await context.bot.send_document(chat_id=user_id, document=csv_file, filename=f"mcq_{mode}_{timestamp}.csv", caption=f"✅ {len(all_questions)} questions processed!\n{mode_emoji} Mode: {mode_name}\n🤖 {config.GEMINI_MODEL}\n\nYou can now post these quizzes to a channel or group!", reply_markup=reply_markup)
+                await context.bot.send_document(chat_id=user_id, document=csv_file, filename=f"mcq_{mode}_{timestamp}.csv", caption=f"✅ {len(all_questions)} questions processed!\n{mode_emoji} Mode: {mode_name}\n🤖 {config.GEMINI_MODEL}\n\nReady to post!", reply_markup=reply_markup)
             await message.edit_text(f"✅ Done!\n\n📝 Total questions: {len(all_questions)}\n📄 Content processed: {len(images)} image(s)\n{mode_emoji} Mode: {mode_name}\n⚡ Processing: {config.MAX_CONCURRENT_IMAGES}x speed")
             for path in content_paths:
                 if path.exists():
@@ -645,24 +896,29 @@ class TelegramBot:
             if user_id in self.user_states:
                 del self.user_states[user_id]
     
-    async def post_quizzes_to_destination(self, user_id: int, chat_id: int, message_thread_id: Optional[int], context: ContextTypes.DEFAULT_TYPE):
+    async def post_quizzes_to_destination(self, user_id: int, chat_id: int, message_thread_id: Optional[int], context: ContextTypes.DEFAULT_TYPE, status_msg):
         if user_id not in self.user_states or 'questions' not in self.user_states[user_id]:
             await context.bot.send_message(chat_id=user_id, text="❌ No questions available to post.")
             return
         questions = self.user_states[user_id]['questions']
-        destination = "channel" if message_thread_id is None and chat_id < 0 else "group"
-        topic_info = f" (Topic ID: {message_thread_id})" if message_thread_id else ""
-        status_msg = await context.bot.send_message(chat_id=user_id, text=f"📢 Posting {len(questions)} quizzes to {destination}{topic_info}...\n\n⏳ This may take a while due to rate limiting.\n\n🔄 Progress: 0/{len(questions)}\n\n*Quiz Format:*\n• Marker: {config.QUIZ_MARKER}\n• Tag: [{config.EXPLANATION_TAG}]", parse_mode='Markdown')
+        source = self.user_states[user_id].get('source', 'generated')
+        settings = db.get_user_settings(user_id)
+        quiz_marker = settings['quiz_marker']
+        explanation_tag = settings['explanation_tag']
+        destination = "channel" if message_thread_id is None else "group"
+        topic_info = f" (Topic: {message_thread_id})" if message_thread_id else ""
+        source_info = "📊 CSV" if source == 'csv' else "🤖 Generated"
+        await status_msg.edit_text(f"📢 Posting {len(questions)} quizzes to {destination}{topic_info}...\n\n{source_info}\n⏳ This may take a while\n\n🔄 Progress: 0/{len(questions)}\n\n📢 Marker: {quiz_marker}\n🔗 Tag: {explanation_tag}")
         async def update_posting_progress(current: int, total: int):
             try:
                 progress = (current / total) * 100
                 est_time = ((total - current) * config.POLL_DELAY) // 60
-                await status_msg.edit_text(f"📢 Posting quizzes to {destination}{topic_info}...\n\n🔄 Progress: {current}/{total}\n📊 {progress:.1f}% completed\n⏱️ Estimated time: ~{est_time} min\n\n*Quiz Format:*\n• Marker: {config.QUIZ_MARKER}\n• Tag: [{config.EXPLANATION_TAG}]", parse_mode='Markdown')
+                await status_msg.edit_text(f"📢 Posting to {destination}{topic_info}...\n\n{source_info}\n🔄 Progress: {current}/{total}\n📊 {progress:.1f}%\n⏱️ ~{est_time} min left\n\n📢 {quiz_marker}\n🔗 {explanation_tag}")
             except:
                 pass
         try:
-            result = await QuizPoster.post_quizzes_batch(context=context, chat_id=chat_id, questions=questions, message_thread_id=message_thread_id, progress_callback=update_posting_progress)
-            await status_msg.edit_text(f"✅ Posting Complete!\n\n📊 Total: {result['total']}\n✅ Success: {result['success']}\n❌ Failed: {result['failed']}\n⏭️ Skipped: {result['skipped']}\n\nDestination: {destination}{topic_info}")
+            result = await QuizPoster.post_quizzes_batch(context=context, chat_id=chat_id, questions=questions, quiz_marker=quiz_marker, explanation_tag=explanation_tag, message_thread_id=message_thread_id, progress_callback=update_posting_progress)
+            await status_msg.edit_text(f"✅ Posting Complete!\n\n{source_info}\n📊 Total: {result['total']}\n✅ Success: {result['success']}\n❌ Failed: {result['failed']}\n⏭️ Skipped: {result['skipped']}\n\n📍 {destination}{topic_info}")
             csv_path = self.user_states[user_id].get('csv_path')
             if csv_path and csv_path.exists():
                 csv_path.unlink(missing_ok=True)
@@ -677,10 +933,12 @@ def main():
     application.post_init = bot.post_init
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("settings", bot.settings_command))
+    application.add_handler(CommandHandler("info", bot.info_command))
     application.add_handler(CommandHandler("model", bot.model_command))
     application.add_handler(CommandHandler("queue", bot.queue_command))
     application.add_handler(CommandHandler("cancel", bot.cancel_command))
-    application.add_handler(MessageHandler(filters.Document.PDF, bot.handle_document))
+    application.add_handler(MessageHandler(filters.Document.ALL, bot.handle_document))
     application.add_handler(MessageHandler(filters.PHOTO, bot.handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
     application.add_handler(CallbackQueryHandler(bot.button_callback))
@@ -689,10 +947,9 @@ def main():
     print(f"⚡ Parallel processing: {config.MAX_CONCURRENT_IMAGES} concurrent images")
     print(f"📋 Max queue size: {config.MAX_QUEUE_SIZE} tasks")
     print(f"🔑 API Keys: {len(config.GEMINI_API_KEYS)}")
-    print(f"📄 Supports: PDF, Single Image, Multiple Images")
-    print(f"📢 Quiz posting: Channels & Groups with rate limiting")
-    print(f"🏷️ Quiz Marker: {config.QUIZ_MARKER}")
-    print(f"🔗 Explanation Tag: {config.EXPLANATION_TAG}")
+    print(f"📄 Supports: PDF, Images, CSV")
+    print(f"📢 Multi-channel/group posting with MongoDB")
+    print(f"🗄️ MongoDB: Connected")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
