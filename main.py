@@ -265,7 +265,7 @@ class QuizPoster:
                     type='quiz',
                     correct_option_id=correct_option_id,
                     explanation=formatted_explanation,
-                    is_anonymous=False,
+                    is_anonymous=True,
                     message_thread_id=message_thread_id
                 )
                 
