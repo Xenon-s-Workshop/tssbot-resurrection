@@ -11,9 +11,7 @@ def require_auth(func):
         if not db.is_authorized(user_id):
             username = update.effective_user.username or "User"
             await update.message.reply_text(
-                f"🔒 *Access Denied*\n\n"
-                f"@{username}, you are not authorized to use {config.BOT_NAME}.\n\n"
-                f"Please contact an administrator for access.",
+                f"🔒 *Access Denied*\n\n@{username}, you are not authorized to use {config.BOT_NAME}.\n\nPlease contact an administrator.",
                 parse_mode='Markdown'
             )
             return
@@ -25,11 +23,7 @@ def require_sudo(func):
     async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if not db.is_sudo(user_id):
-            await update.message.reply_text(
-                "🔐 *Sudo Access Required*\n\n"
-                "This command requires administrator privileges.",
-                parse_mode='Markdown'
-            )
+            await update.message.reply_text("🔐 *Sudo Access Required*\n\nThis command requires admin privileges.", parse_mode='Markdown')
             return
         return await func(self, update, context, *args, **kwargs)
     return wrapper

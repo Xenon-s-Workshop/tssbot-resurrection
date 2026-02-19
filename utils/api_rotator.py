@@ -7,7 +7,7 @@ class GeminiAPIRotator:
         self.current_index = 0
         self.lock = Lock()
         if not self.api_keys:
-            raise ValueError("No valid Gemini API keys!")
+            raise ValueError("No valid API keys!")
     
     def get_next_key(self) -> str:
         with self.lock:

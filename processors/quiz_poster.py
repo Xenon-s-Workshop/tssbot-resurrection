@@ -1,3 +1,7 @@
+"""
+Quiz Poster - WITH PROGRESS CALLBACK
+"""
+
 import asyncio
 from typing import List, Dict, Optional
 from telegram.ext import ContextTypes
@@ -28,13 +32,20 @@ class QuizPoster:
                 opts = question.get('options', [])[:10]
                 if len(opts) < 2:
                     return False
+                
                 correct_id = max(0, min(question.get('correct_answer_index', 0), len(opts) - 1))
                 q = QuizPoster.format_question(question.get('question_description', ''), marker)
                 e = QuizPoster.format_explanation(question.get('explanation', ''), tag)
+                
                 await context.bot.send_poll(
-                    chat_id=chat_id, question=q, options=opts, type='quiz',
-                    correct_option_id=correct_id, explanation=e,
-                    is_anonymous=True, message_thread_id=thread_id
+                    chat_id=chat_id,
+                    question=q,
+                    options=opts,
+                    type='quiz',
+                    correct_option_id=correct_id,
+                    explanation=e,
+                    is_anonymous=True,
+                    message_thread_id=thread_id
                 )
                 return True
             except (RetryAfter, TimedOut):
@@ -45,23 +56,42 @@ class QuizPoster:
     
     @staticmethod
     async def post_quizzes_batch(context, chat_id, questions, marker, tag, thread_id=None, progress_callback=None):
+        """Post quizzes with DETAILED PROGRESS TRACKING"""
         total = len(questions)
         success = failed = skipped = 0
+        
         for i in range(0, total, config.BATCH_SIZE):
             batch = questions[i:i + config.BATCH_SIZE]
+            
             for idx, q in enumerate(batch):
                 global_idx = i + idx + 1
+                
+                # UPDATE PROGRESS with success/failed counts
                 if progress_callback:
-                    await progress_callback(global_idx, total)
+                    await progress_callback(global_idx, total, success, failed)
+                
+                # Validate question
                 if not q.get('question_description') or not q.get('options'):
                     skipped += 1
                     continue
+                
+                # Send quiz
                 if await QuizPoster.send_quiz_with_retry(context, chat_id, q, marker, tag, thread_id):
                     success += 1
                 else:
                     failed += 1
+                
+                # Delay between quizzes
                 if global_idx < total:
                     await asyncio.sleep(config.POLL_DELAY)
+            
+            # Delay between batches
             if i + config.BATCH_SIZE < total:
                 await asyncio.sleep(config.BATCH_DELAY)
-        return {'total': total, 'success': success, 'failed': failed, 'skipped': skipped}
+        
+        return {
+            'total': total,
+            'success': success,
+            'failed': failed,
+            'skipped': skipped
+        }
