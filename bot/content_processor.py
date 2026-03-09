@@ -1,8 +1,4 @@
-"""
-Content Processor - WITH DUAL AI SUPPORT + PROGRESS BARS
-Routes to Gemini or DeepSeek based on per-user setting
-"""
-
+"""Content Processor - WITH PROGRESS BARS"""
 import asyncio
 from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,25 +15,14 @@ class ContentProcessor:
 
     async def process_content(self, user_id, content_type, content_paths, page_range, mode, context):
         try:
-            # Pick processor based on user's chosen AI provider
-            processor = self.bot_handlers.get_processor(user_id)
-            settings = db.get_user_settings(user_id)
-            provider = settings.get('ai_provider', 'gemini')
-            provider_label = "🟢 Gemini" if provider == 'gemini' else f"🔵 DeepSeek ({settings.get('deepseek_model','')})"
-
             if content_type == 'pdf':
                 msg = await context.bot.send_message(
                     user_id,
-                    f"🔄 Processing PDF...\n"
-                    f"📄 Pages: {'All' if not page_range else f'{page_range[0]}-{page_range[1]}'}\n"
-                    f"🤖 AI: {provider_label}"
+                    f"🔄 Processing PDF...\n📄 Pages: {'All' if not page_range else f'{page_range[0]}-{page_range[1]}'}"
                 )
                 images = await PDFProcessor.pdf_to_images(content_paths[0], page_range)
             else:
-                msg = await context.bot.send_message(
-                    user_id,
-                    f"🔄 Processing images...\n🤖 AI: {provider_label}"
-                )
+                msg = await context.bot.send_message(user_id, "🔄 Processing images...")
                 images = [await ImageProcessor.load_image(p) for p in content_paths]
 
             total = len(images)
@@ -47,20 +32,16 @@ class ContentProcessor:
                     pct = int((current / total_pages) * 100)
                     bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                     await msg.edit_text(
-                        f"🔍 *Processing...*\n\n"
-                        f"`[{bar}]` {pct}%\n"
-                        f"Page {current} of {total_pages}\n"
-                        f"🤖 AI: {provider_label}\n"
-                        f"Mode: {mode}",
+                        f"🔍 *Processing...*\n\n`[{bar}]` {pct}%\nPage {current}/{total_pages}\nMode: {mode}",
                         parse_mode='Markdown'
                     )
                 except:
                     pass
 
-            questions = await processor.process_images_parallel(images, mode, progress)
+            questions = await self.bot_handlers.pdf_processor.process_images_parallel(images, mode, progress)
 
             if not questions:
-                await msg.edit_text("❌ No questions found. Try switching AI provider in /settings")
+                await msg.edit_text("❌ No questions found.")
                 return
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -82,19 +63,13 @@ class ContentProcessor:
 
             with open(csv_path, 'rb') as f:
                 await context.bot.send_document(
-                    user_id, f,
-                    filename=f"mcq_{timestamp}.csv",
-                    caption=f"✅ *Complete!*\n\n"
-                            f"📊 Questions: {len(questions)}\n"
-                            f"🤖 AI: {provider_label}\n\n"
-                            f"Choose action:",
+                    user_id, f, filename=f"mcq_{timestamp}.csv",
+                    caption=f"✅ *Complete!*\n\n📊 Questions: {len(questions)}",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
 
-            await msg.edit_text(
-                f"✅ Done! {len(questions)} questions\n🤖 {provider_label}"
-            )
+            await msg.edit_text(f"✅ Done! {len(questions)} questions")
 
             for p in content_paths:
                 if p.exists():
@@ -118,10 +93,8 @@ class ContentProcessor:
                 pct = int((current / total) * 100)
                 bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 await status_msg.edit_text(
-                    f"📊 *Posting Quizzes...*\n\n"
-                    f"`[{bar}]` {pct}%\n"
-                    f"Quiz {current} of {total}\n"
-                    f"✅ Success: {success}  ❌ Failed: {failed}",
+                    f"📊 *Posting...*\n\n`[{bar}]` {pct}%\n"
+                    f"Quiz {current}/{total}\n✅ {success}  ❌ {failed}",
                     parse_mode='Markdown'
                 )
             except:
@@ -134,11 +107,8 @@ class ContentProcessor:
         )
 
         await status_msg.edit_text(
-            f"✅ *Posting Complete!*\n\n"
-            f"📊 Total: {result['total']}\n"
-            f"✅ Success: {result['success']}\n"
-            f"❌ Failed: {result['failed']}\n"
-            f"⏭️ Skipped: {result['skipped']}",
+            f"✅ *Complete!*\n\n📊 Total: {result['total']}\n"
+            f"✅ Success: {result['success']}\n❌ Failed: {result['failed']}\n⏭️ Skipped: {result['skipped']}",
             parse_mode='Markdown'
         )
 
