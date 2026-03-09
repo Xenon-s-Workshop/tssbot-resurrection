@@ -1,289 +1,312 @@
 """
-PDF Exporter - FIXED with HTML escaping
-No paraparser errors, Bengali support, 2 formats
+Poll Collector - FULLY WORKING
+Collects polls when forwarded/sent after /collectpolls command
 """
 
 import re
-import os
 from typing import List, Dict
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.enums import TA_LEFT
+from processors.csv_processor import CSVGenerator
 from config import config
 
-class PDFExporter:
+class PollCollector:
     def __init__(self):
-        self.sessions = {}
-        self._register_fonts()
+        self.sessions = {}  # {user_id: {'polls': [], 'status_msg_id': int, 'active': bool}}
+        print("✅ Poll Collector initialized")
     
-    def _register_fonts(self):
-        """Register Bengali fonts"""
-        try:
-            dejavu_paths = [
-                '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-                '/System/Library/Fonts/Supplemental/DejaVuSans.ttf',
-                'C:\\Windows\\Fonts\\DejaVuSans.ttf'
-            ]
-            for path in dejavu_paths:
-                if os.path.exists(path):
-                    pdfmetrics.registerFont(TTFont('DejaVu', path))
-                    self.font_family = 'DejaVu'
-                    print("✅ Bengali font support enabled")
-                    return
-        except:
-            pass
-        self.font_family = 'Helvetica'
-        print("⚠️ Using Helvetica (no Bengali support)")
+    def is_collecting(self, user_id: int) -> bool:
+        """Check if user has active collection session"""
+        return user_id in self.sessions and self.sessions[user_id].get('active', False)
     
-    @staticmethod
-    def escape_html(text: str) -> str:
-        """Escape HTML special characters to prevent paraparser errors"""
-        if not text:
-            return ""
-        text = text.replace('&', '&amp;')
-        text = text.replace('<', '&lt;')
-        text = text.replace('>', '&gt;')
-        text = text.replace('"', '&quot;')
-        text = text.replace("'", '&#39;')
-        return text
+    def start_collection(self, user_id: int):
+        """Start collecting polls for user"""
+        self.sessions[user_id] = {
+            'polls': [], 
+            'active': True, 
+            'started_at': datetime.now(),
+            'status_msg_id': None
+        }
+        print(f"📮 Started collection for user {user_id}")
+    
+    def stop_collection(self, user_id: int):
+        """Stop collecting and return count"""
+        if user_id in self.sessions:
+            count = len(self.sessions[user_id].get('polls', []))
+            del self.sessions[user_id]
+            print(f"❌ Stopped collection for user {user_id} ({count} polls)")
+            return count
+        return 0
+    
+    def add_poll(self, user_id: int, poll: Poll) -> int:
+        """Add poll to collection and return total count"""
+        if not self.is_collecting(user_id):
+            print(f"⚠️ User {user_id} not collecting - ignoring poll")
+            return 0
+        
+        # Extract poll data
+        options = [opt.text for opt in poll.options]
+        correct_index = poll.correct_option_id if poll.type == 'quiz' and poll.correct_option_id is not None else 0
+        
+        poll_data = {
+            'question': poll.question,
+            'options': options,
+            'correct_index': correct_index,
+            'correct_option': chr(65 + correct_index) if correct_index >= 0 else 'A',
+            'explanation': poll.explanation or ''
+        }
+        
+        self.sessions[user_id]['polls'].append(poll_data)
+        count = len(self.sessions[user_id]['polls'])
+        print(f"✅ User {user_id} collected poll #{count}: {poll.question[:50]}...")
+        return count
+    
+    def get_polls(self, user_id: int) -> List[Dict]:
+        """Get all collected polls for user"""
+        return self.sessions.get(user_id, {}).get('polls', [])
+    
+    def clear_polls(self, user_id: int):
+        """Clear all collected polls"""
+        if user_id in self.sessions:
+            self.sessions[user_id]['polls'] = []
+            print(f"🗑️ Cleared polls for user {user_id}")
+    
+    def set_status_message(self, user_id: int, message_id: int):
+        """Store status message ID for live updates"""
+        if user_id in self.sessions:
+            self.sessions[user_id]['status_msg_id'] = message_id
+    
+    def get_status_message(self, user_id: int) -> int:
+        """Get status message ID"""
+        return self.sessions.get(user_id, {}).get('status_msg_id')
     
     @staticmethod
     def cleanup_text(text: str) -> str:
-        """Remove [tags] and links"""
+        """Remove [tags] and links from text"""
         if not text:
             return text
+        # Remove [tags]
         text = re.sub(r'\[[^\]]+\]', '', text)
+        # Remove URLs
         text = re.sub(r'https?://\S+', '', text)
         text = re.sub(r'www\.\S+', '', text)
         text = re.sub(r't\.me/\S+', '', text)
+        # Clean whitespace
         return re.sub(r'\s+', ' ', text).strip()
     
-    def cleanup_questions(self, questions: List[Dict]) -> List[Dict]:
-        return [{
-            'question_description': self.cleanup_text(q.get('question_description', '')),
-            'options': [self.cleanup_text(opt) for opt in q.get('options', [])],
-            'correct_answer_index': q.get('correct_answer_index', 0),
-            'correct_option': q.get('correct_option', 'A'),
-            'explanation': self.cleanup_text(q.get('explanation', ''))
-        } for q in questions]
+    def cleanup_polls(self, polls: List[Dict]) -> List[Dict]:
+        """Clean all polls in list"""
+        cleaned = []
+        for p in polls:
+            cleaned.append({
+                'question_description': self.cleanup_text(p['question']),
+                'options': [self.cleanup_text(opt) for opt in p['options']],
+                'correct_answer_index': p['correct_index'],
+                'correct_option': p['correct_option'],
+                'explanation': self.cleanup_text(p['explanation'])
+            })
+        return cleaned
     
-    def start_export(self, user_id: int, questions: List[Dict]):
-        self.sessions[user_id] = {'questions': questions, 'waiting_for_name': True}
+    # ==================== COMMAND HANDLER ====================
     
-    def is_waiting_for_name(self, user_id: int) -> bool:
-        return self.sessions.get(user_id, {}).get('waiting_for_name', False)
-    
-    def set_pdf_name(self, user_id: int, name: str):
-        if user_id in self.sessions:
-            self.sessions[user_id]['pdf_name'] = name
-            self.sessions[user_id]['waiting_for_name'] = False
-    
-    def get_session(self, user_id: int) -> Dict:
-        return self.sessions.get(user_id, {})
-    
-    def clear_session(self, user_id: int):
-        self.sessions.pop(user_id, None)
-    
-    # ==================== FORMAT 1: STANDARD ====================
-    
-    def generate_standard_format(self, questions: List[Dict], output_path, title: str):
-        """Format 1: Standard - Compact layout"""
-        doc = SimpleDocTemplate(str(output_path), pagesize=A4,
-                               topMargin=0.5*inch, bottomMargin=0.5*inch,
-                               leftMargin=0.5*inch, rightMargin=0.5*inch)
+    async def handle_start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /collectpolls command"""
+        user_id = update.effective_user.id
         
-        story = []
-        styles = getSampleStyleSheet()
-        
-        # Title
-        title_style = ParagraphStyle('Title', parent=styles['Heading1'],
-                                     fontName=self.font_family, fontSize=16,
-                                     alignment=TA_LEFT, spaceAfter=20)
-        story.append(Paragraph(self.escape_html(title), title_style))
-        story.append(Spacer(1, 0.2*inch))
-        
-        # Questions
-        for idx, q in enumerate(questions, 1):
-            q_text = self.escape_html(q['question_description'])
-            q_style = ParagraphStyle('Q', parent=styles['Normal'],
-                                    fontName=self.font_family, fontSize=11, spaceAfter=6)
-            story.append(Paragraph(f"<b>{idx}.</b> {q_text}", q_style))
-            
-            # Options
-            for i, opt in enumerate(q['options']):
-                opt_letter = chr(65 + i)
-                is_correct = (i == q['correct_answer_index'])
-                marker = "✓" if is_correct else "○"
-                opt_text = self.escape_html(opt)
-                opt_style = ParagraphStyle('O', parent=styles['Normal'],
-                                          fontName=self.font_family, fontSize=10,
-                                          leftIndent=20, spaceAfter=3)
-                story.append(Paragraph(f"{marker} <b>{opt_letter}.</b> {opt_text}", opt_style))
-            
-            # Answer
-            ans_style = ParagraphStyle('A', parent=styles['Normal'],
-                                      fontName=self.font_family, fontSize=9,
-                                      leftIndent=20, spaceAfter=12,
-                                      textColor=colors.HexColor('#006400'))
-            story.append(Paragraph(f"<b>Answer: {q['correct_option']}</b>", ans_style))
-            
-            if idx % 10 == 0 and idx < len(questions):
-                story.append(PageBreak())
-        
-        doc.build(story)
-    
-    # ==================== FORMAT 2: DETAILED ====================
-    
-    def generate_detailed_format(self, questions: List[Dict], output_path, title: str):
-        """Format 2: Detailed - With explanations"""
-        doc = SimpleDocTemplate(str(output_path), pagesize=A4,
-                               topMargin=0.5*inch, bottomMargin=0.5*inch,
-                               leftMargin=0.5*inch, rightMargin=0.5*inch)
-        
-        story = []
-        styles = getSampleStyleSheet()
-        
-        # Title
-        title_style = ParagraphStyle('Title', parent=styles['Heading1'],
-                                     fontName=self.font_family, fontSize=16,
-                                     alignment=TA_LEFT, spaceAfter=20)
-        story.append(Paragraph(self.escape_html(title), title_style))
-        story.append(Spacer(1, 0.3*inch))
-        
-        # Questions
-        for idx, q in enumerate(questions, 1):
-            q_text = self.escape_html(q['question_description'])
-            q_style = ParagraphStyle('Q', parent=styles['Normal'],
-                                    fontName=self.font_family, fontSize=12, spaceAfter=10)
-            story.append(Paragraph(f"<b>{idx}. {q_text}</b>", q_style))
-            
-            # Options
-            for i, opt in enumerate(q['options']):
-                opt_letter = chr(65 + i)
-                is_correct = (i == q['correct_answer_index'])
-                marker = "✓" if is_correct else "○"
-                opt_text = self.escape_html(opt)
-                opt_style = ParagraphStyle('O', parent=styles['Normal'],
-                                          fontName=self.font_family, fontSize=11,
-                                          leftIndent=25, spaceAfter=5,
-                                          textColor=colors.HexColor('#006400') if is_correct else colors.black)
-                story.append(Paragraph(f"{marker} <b>{opt_letter}.</b> {opt_text}", opt_style))
-            
-            # Explanation
-            if q.get('explanation'):
-                exp_text = self.escape_html(q['explanation'])
-                exp_style = ParagraphStyle('E', parent=styles['Normal'],
-                                          fontName=self.font_family, fontSize=10,
-                                          leftIndent=25, spaceAfter=15,
-                                          textColor=colors.HexColor('#555555'))
-                story.append(Paragraph(f"<i>💡 {exp_text}</i>", exp_style))
-            else:
-                story.append(Spacer(1, 0.1*inch))
-            
-            story.append(Spacer(1, 0.05*inch))
-            
-            if idx % 6 == 0 and idx < len(questions):
-                story.append(PageBreak())
-        
-        doc.build(story)
-    
-    # ==================== HANDLERS ====================
-    
-    async def handle_pdf_export_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE, questions: List[Dict]):
-        user_id = update.effective_user.id if hasattr(update, 'effective_user') else update.callback_query.from_user.id
-        
-        self.start_export(user_id, questions)
-        
-        if hasattr(update, 'callback_query'):
-            await update.callback_query.edit_message_text(
-                "📄 *PDF Export*\n\nSend PDF name (without .pdf):\n\nExample: `Biology_Quiz_2024`",
+        if self.is_collecting(user_id):
+            # Already collecting - show status
+            count = len(self.get_polls(user_id))
+            keyboard = [
+                [InlineKeyboardButton("📊 Export CSV", callback_data="poll_export_csv")],
+                [InlineKeyboardButton("📄 Export PDF", callback_data="poll_export_pdf")],
+                [InlineKeyboardButton("🗑️ Clear All", callback_data="poll_clear")],
+                [InlineKeyboardButton("❌ Stop Collection", callback_data="poll_stop")]
+            ]
+            await update.message.reply_text(
+                f"📮 *Poll Collection Active*\n\n"
+                f"📊 Collected: *{count}* polls\n\n"
+                f"✅ Forward or send polls to me\n"
+                f"🗑️ Forwarded polls will auto-delete\n"
+                f"📈 Live counter updates automatically",
+                reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
         else:
-            await update.message.reply_text(
-                "📄 *PDF Export*\n\nSend PDF name (without .pdf):\n\nExample: `Biology_Quiz_2024`",
+            # Start new collection
+            self.start_collection(user_id)
+            keyboard = [
+                [InlineKeyboardButton("❌ Stop Collection", callback_data="poll_stop")]
+            ]
+            msg = await update.message.reply_text(
+                "📮 *Poll Collection Started!*\n\n"
+                "📊 Collected: *0* polls\n\n"
+                "✅ Now forward or send polls to me\n"
+                "🗑️ Forwarded polls auto-delete\n"
+                "📈 Counter updates live\n\n"
+                "💡 *Tip:* Just forward polls from any chat!",
+                reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
+            self.set_status_message(user_id, msg.message_id)
+            print(f"📮 User {user_id} started collection, status msg: {msg.message_id}")
     
-    async def handle_pdf_name_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ==================== POLL MESSAGE HANDLER ====================
+    
+    async def handle_poll_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming poll messages - THIS GETS CALLED WHEN USER SENDS/FORWARDS A POLL"""
         user_id = update.effective_user.id
-        pdf_name = update.message.text.strip()
-        pdf_name = re.sub(r'[<>:"/\\|?*]', '', pdf_name) or f"MCQ_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        self.set_pdf_name(user_id, pdf_name)
+        # Check if user is collecting
+        if not self.is_collecting(user_id):
+            print(f"⚠️ User {user_id} sent poll but not collecting - ignoring")
+            return
+        
+        # Get poll from message
+        poll = update.message.poll if update.message else update.poll
+        if not poll:
+            print(f"⚠️ No poll found in update from user {user_id}")
+            return
+        
+        print(f"📥 Received poll from user {user_id}: {poll.question[:50]}...")
+        
+        # Add poll to collection
+        count = self.add_poll(user_id, poll)
+        
+        # Delete the forwarded message
+        try:
+            await update.message.delete()
+            print(f"🗑️ Deleted poll message for user {user_id}")
+        except Exception as e:
+            print(f"⚠️ Could not delete poll message: {e}")
+        
+        # Update status message with new count
+        status_msg_id = self.get_status_message(user_id)
+        if status_msg_id:
+            try:
+                keyboard = [
+                    [InlineKeyboardButton("📊 Export CSV", callback_data="poll_export_csv")],
+                    [InlineKeyboardButton("📄 Export PDF", callback_data="poll_export_pdf")],
+                    [InlineKeyboardButton("🗑️ Clear All", callback_data="poll_clear")],
+                    [InlineKeyboardButton("❌ Stop Collection", callback_data="poll_stop")]
+                ]
+                await context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=status_msg_id,
+                    text=f"📮 *Poll Collection Active!*\n\n"
+                         f"📊 Collected: *{count}* polls\n\n"
+                         f"✅ Keep forwarding polls\n"
+                         f"🗑️ Auto-deleting as you send\n"
+                         f"📈 Live counter active\n\n"
+                         f"💡 Collection running smoothly!",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+                print(f"✅ Updated status message for user {user_id} - count: {count}")
+            except Exception as e:
+                print(f"⚠️ Could not update status message: {e}")
+    
+    # ==================== CALLBACK HANDLERS ====================
+    
+    async def handle_export_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export collected polls to CSV"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        polls = self.get_polls(user_id)
+        if not polls:
+            await query.answer("❌ No polls collected!")
+            return
+        
+        await query.answer("📊 Generating CSV...")
+        
+        # Clean and convert to questions format
+        cleaned = self.cleanup_polls(polls)
+        
+        # Generate CSV
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = config.OUTPUT_DIR / f"polls_{user_id}_{timestamp}.csv"
+        CSVGenerator.questions_to_csv(cleaned, csv_path)
+        
+        # Send CSV file
+        with open(csv_path, 'rb') as f:
+            await context.bot.send_document(
+                user_id, f,
+                filename=f"polls_{timestamp}.csv",
+                caption=f"📊 *CSV Export Complete!*\n\n"
+                        f"📝 Total polls: *{len(polls)}*\n"
+                        f"✨ Text cleaned and formatted\n\n"
+                        f"Collection still active!",
+                parse_mode='Markdown'
+            )
+        
+        # Cleanup
+        csv_path.unlink(missing_ok=True)
+        
+        await query.edit_message_text(
+            f"✅ *CSV Export Complete!*\n\n"
+            f"📊 Exported: *{len(polls)}* polls\n\n"
+            f"Collection still active.\nUse /collectpolls to manage.",
+            parse_mode='Markdown'
+        )
+    
+    async def handle_export_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export collected polls to PDF"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        polls = self.get_polls(user_id)
+        if not polls:
+            await query.answer("❌ No polls collected!")
+            return
+        
+        await query.answer("📄 Preparing PDF export...")
+        
+        # Clean and convert to questions format
+        cleaned = self.cleanup_polls(polls)
+        
+        # Import PDF exporter
+        from processors.pdf_exporter import pdf_exporter
+        
+        # Start PDF export flow
+        await pdf_exporter.handle_pdf_export_start(update, context, cleaned)
+    
+    async def handle_clear(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Clear all collected polls"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        self.clear_polls(user_id)
         
         keyboard = [
-            [InlineKeyboardButton("📋 Standard", callback_data="pdf_format_1")],
-            [InlineKeyboardButton("📝 Detailed", callback_data="pdf_format_2")]
+            [InlineKeyboardButton("❌ Stop Collection", callback_data="poll_stop")]
         ]
         
-        await update.message.reply_text(
-            f"✅ PDF Name: `{pdf_name}.pdf`\n\n"
-            f"📄 *Choose Format:*\n\n"
-            f"📋 *Standard* - Compact (~10 Q/page)\n"
-            f"📝 *Detailed* - With explanations (~6 Q/page)\n\n"
-            f"Select below:",
+        await query.answer("🗑️ All polls cleared!")
+        await query.edit_message_text(
+            "🗑️ *All Polls Cleared!*\n\n"
+            "📊 Collected: *0* polls\n\n"
+            "✅ Ready to collect again\n"
+            "💡 Forward polls to start collecting!",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
     
-    async def handle_format_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, format_num: int):
+    async def handle_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Stop poll collection"""
         query = update.callback_query
-        user_id = query.from_user.id
+        user_id = update.effective_user.id
         
-        session = self.get_session(user_id)
-        if not session or 'questions' not in session:
-            await query.answer("❌ Session expired!")
-            return
+        count = self.stop_collection(user_id)
         
-        questions = session['questions']
-        pdf_name = session.get('pdf_name', f"MCQ_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        
-        progress_msg = await query.edit_message_text("⏳ Generating PDF... 0%")
-        
-        cleaned = self.cleanup_questions(questions)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{pdf_name}_{timestamp}.pdf"
-        pdf_path = config.OUTPUT_DIR / filename
-        
-        try:
-            await progress_msg.edit_text("⏳ Generating PDF... 50%")
-            
-            if format_num == 1:
-                self.generate_standard_format(cleaned, pdf_path, pdf_name)
-            else:
-                self.generate_detailed_format(cleaned, pdf_path, pdf_name)
-            
-            await progress_msg.edit_text("⏳ Generating PDF... 100%")
-            
-            with open(pdf_path, 'rb') as f:
-                await context.bot.send_document(
-                    user_id, f, filename=filename,
-                    caption=f"✅ *PDF Generated!*\n\n"
-                            f"📄 {pdf_name}\n"
-                            f"📊 Questions: {len(cleaned)}\n"
-                            f"🎨 {'Standard' if format_num == 1 else 'Detailed'}",
-                    parse_mode='Markdown'
-                )
-            
-            pdf_path.unlink(missing_ok=True)
-            self.clear_session(user_id)
-            
-            await query.answer("✅ PDF sent!")
-            await progress_msg.edit_text("✅ PDF export complete!")
-            
-        except Exception as e:
-            await query.answer("❌ Error!")
-            await progress_msg.edit_text(f"❌ Error: {e}")
-            self.clear_session(user_id)
+        await query.answer("❌ Collection stopped!")
+        await query.edit_message_text(
+            f"❌ *Collection Stopped*\n\n"
+            f"📊 Final count: *{count}* polls\n\n"
+            f"✅ Use /collectpolls to start again\n"
+            f"💡 Your polls are saved until export!",
+            parse_mode='Markdown'
+        )
 
-pdf_exporter = PDFExporter()
+# Create global instance
+poll_collector = PollCollector()
