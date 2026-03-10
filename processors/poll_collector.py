@@ -1,15 +1,21 @@
 """
-Poll Collector - COMPLETE REWRITE with BATCH PROCESSING
-Based on reference implementation with auto-delete and live progress
+Poll Collector - COMPLETE WITH BATCH PROCESSING
+Features:
+- Batch processing with live progress updates
+- Auto-delete forwarded polls
+- Export to CSV and PDF
+- Clean question formatting
+- Live counter updates every 2 seconds
 """
 
 import re
 import asyncio
+import os
+import tempfile
 from typing import List, Dict
 from datetime import datetime
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
-from processors.csv_processor import CSVGenerator
+from telegram.ext import ContextTypes, Application
 from config import config
 
 class PollCollector:
@@ -17,7 +23,13 @@ class PollCollector:
         self.sessions = {}  # {user_id: session_data}
         self.MAX_POLLS = 200
         self.BATCH_DELAY = 2  # Wait 2 seconds before processing batch
+        self.application = None  # Will be set by main.py
         print("✅ Poll Collector initialized with batch processing")
+    
+    def set_application(self, application: Application):
+        """Set the Telegram application for sending messages"""
+        self.application = application
+        print("✅ Poll Collector connected to bot application")
     
     # ==================== SESSION MANAGEMENT ====================
     
@@ -207,8 +219,16 @@ class PollCollector:
             f"✅ **Polls processed: {count}/{self.MAX_POLLS}**\n"
             f"{progress_bar}\n"
             f"{last_q_text}\n"
-            f"Send more polls or use `/done` to finish."
+            f"Send more polls or use buttons below."
         )
+        
+        # Add buttons
+        keyboard = [
+            [InlineKeyboardButton("📊 Export CSV", callback_data="poll_export_csv")],
+            [InlineKeyboardButton("📄 Export PDF", callback_data="poll_export_pdf")],
+            [InlineKeyboardButton("🗑️ Clear All", callback_data="poll_clear")],
+            [InlineKeyboardButton("❌ Stop Collection", callback_data="poll_stop")]
+        ]
         
         # Update or create message
         if session['status_msg_id'] and session['chat_id']:
@@ -217,6 +237,7 @@ class PollCollector:
                     chat_id=session['chat_id'],
                     message_id=session['status_msg_id'],
                     text=text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
             except Exception as e:
@@ -225,6 +246,7 @@ class PollCollector:
                 msg = await context.bot.send_message(
                     session['chat_id'],
                     text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
                 session['status_msg_id'] = msg.message_id
@@ -233,7 +255,7 @@ class PollCollector:
         if count >= self.MAX_POLLS:
             await context.bot.send_message(
                 session['chat_id'],
-                f"🎉 **Maximum polls collected!** ({self.MAX_POLLS})\nUse `/done` to generate CSV.",
+                f"🎉 **Maximum polls collected!** ({self.MAX_POLLS})\nUse buttons to export.",
                 parse_mode='Markdown'
             )
     
@@ -328,12 +350,11 @@ class PollCollector:
         await query.answer("📊 Generating CSV...")
         
         # Generate CSV
-        import tempfile
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = session['filename']
         
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.csv', encoding='utf-8') as tmp:
-            CSVGenerator.questions_to_csv(session['polls'], tmp.name)
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.csv', encoding='utf-8', newline='') as tmp:
+            self._generate_csv(session['polls'], tmp.name)
             
             with open(tmp.name, 'rb') as f:
                 await context.bot.send_document(
@@ -346,7 +367,6 @@ class PollCollector:
                     parse_mode='Markdown'
                 )
         
-        import os
         os.unlink(tmp.name)
         
         await query.edit_message_text(
@@ -419,6 +439,23 @@ class PollCollector:
             f"✅ Use /collectpolls to start again",
             parse_mode='Markdown'
         )
+    
+    # ==================== CSV GENERATION ====================
+    
+    def _generate_csv(self, polls: List[Dict], filepath: str):
+        """Generate CSV file from polls"""
+        import csv
+        
+        fieldnames = [
+            'questions', 'option1', 'option2', 'option3', 'option4',
+            'option5', 'answer', 'explanation', 'type', 'section'
+        ]
+        
+        with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+            writer.writeheader()
+            for poll in polls:
+                writer.writerow(poll)
 
 # Global instance
 poll_collector = PollCollector()
