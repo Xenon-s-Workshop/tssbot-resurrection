@@ -1,10 +1,15 @@
 """
-Bot Handlers - WITH ENHANCED START and LIVE QUIZ
-- Detailed start command with full feature list
+Bot Handlers - COMPLETE WITH ALL FEATURES
+- Enhanced start command with detailed help
 - Live quiz integration
-- Ghost bug fixed
+- Ghost bug prevention with timeout checks
+- Poll collection
+- File processing
 """
 
+import re
+import json
+import tempfile
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -181,7 +186,6 @@ class BotHandlers:
         # Download and load
         msg = await update.message.reply_text("📥 *Loading quiz...*", parse_mode='Markdown')
         
-        import tempfile
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
             file = await context.bot.get_file(doc.file_id)
             await file.download_to_drive(tmp.name)
@@ -219,7 +223,6 @@ class BotHandlers:
     
     def _parse_quiz_args(self, text: str) -> dict:
         """Parse quiz command arguments"""
-        import re
         args = {}
         
         # -m "message"
@@ -282,7 +285,6 @@ class BotHandlers:
     
     async def _load_quiz_from_json(self, path: str) -> list:
         """Load quiz from JSON"""
-        import json
         questions = []
         
         try:
@@ -397,6 +399,9 @@ class BotHandlers:
         """Check queue status - GHOST BUG FIXED"""
         user_id = update.effective_user.id
         
+        # Force timeout check
+        task_queue._check_timeout(user_id)
+        
         # Check if actually processing (with timeout check)
         if task_queue.is_processing(user_id):
             await update.message.reply_text("⚙️ Your task is being processed...")
@@ -405,7 +410,7 @@ class BotHandlers:
             if pos > 0:
                 await update.message.reply_text(f"📋 Queue position: {pos}")
             else:
-                await update.message.reply_text("❌ No tasks in queue.")
+                await update.message.reply_text("✅ No tasks in queue or processing.")
     
     @require_auth
     async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -422,7 +427,7 @@ class BotHandlers:
     
     @require_auth
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle document upload"""
+        """Handle document upload - GHOST BUG PREVENTION"""
         user_id = update.effective_user.id
         doc = update.message.document
         
@@ -434,8 +439,16 @@ class BotHandlers:
             await update.message.reply_text("❌ Send PDF or CSV only.")
             return
         
+        # ===== GHOST BUG PREVENTION - Force timeout check =====
+        task_queue._check_timeout(user_id)
+        
+        # Double check if actually processing
         if user_id in self.user_states or task_queue.is_processing(user_id):
-            await update.message.reply_text("⚠️ Task in progress. Use `/cancel`", parse_mode='Markdown')
+            await update.message.reply_text(
+                "⚠️ *Task in progress*\n\n"
+                "If stuck, use `/cancel` to force clear.",
+                parse_mode='Markdown'
+            )
             return
         
         msg = await update.message.reply_text("📥 Downloading PDF...")
@@ -459,11 +472,18 @@ class BotHandlers:
     
     @require_auth
     async def handle_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle CSV upload"""
+        """Handle CSV upload - GHOST BUG PREVENTION"""
         user_id = update.effective_user.id
         
+        # ===== GHOST BUG PREVENTION =====
+        task_queue._check_timeout(user_id)
+        
         if user_id in self.user_states or task_queue.is_processing(user_id):
-            await update.message.reply_text("⚠️ Task in progress.")
+            await update.message.reply_text(
+                "⚠️ *Task in progress*\n\n"
+                "If stuck, use `/cancel` to force clear.",
+                parse_mode='Markdown'
+            )
             return
         
         msg = await update.message.reply_text("📊 Processing CSV...")
@@ -473,11 +493,15 @@ class BotHandlers:
             questions = CSVParser.parse_csv_file(bytes(content))
             
             if not questions:
-                await msg.edit_text("❌ No valid questions.")
+                await msg.edit_text("❌ No valid questions found in CSV.")
                 return
             
             session_id = f"csv_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.user_states[user_id] = {'questions': questions, 'session_id': session_id}
+            self.user_states[user_id] = {
+                'questions': questions,
+                'session_id': session_id,
+                'source': 'csv'
+            }
             
             keyboard = [
                 [InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")],
@@ -485,35 +509,51 @@ class BotHandlers:
                 [InlineKeyboardButton("📄 Export PDF", callback_data=f"export_pdf_{session_id}")]
             ]
             await msg.edit_text(
-                f"✅ *CSV Processed!*\n📊 Questions: {len(questions)}",
+                f"✅ *CSV Processed!*\n\n"
+                f"📊 Questions: {len(questions)}\n\n"
+                f"Choose action:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
         except Exception as e:
-            await msg.edit_text(f"❌ Error: {e}")
+            await msg.edit_text(f"❌ Error processing CSV: {str(e)[:200]}")
     
     @require_auth
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle photo upload"""
+        """Handle photo upload - GHOST BUG PREVENTION"""
         user_id = update.effective_user.id
         
+        # ===== GHOST BUG PREVENTION =====
+        task_queue._check_timeout(user_id)
+        
         if user_id in self.user_states or task_queue.is_processing(user_id):
-            await update.message.reply_text("⚠️ Task in progress.")
+            await update.message.reply_text(
+                "⚠️ *Task in progress*\n\n"
+                "If stuck, use `/cancel` to force clear.",
+                parse_mode='Markdown'
+            )
             return
         
-        msg = await update.message.reply_text("📥 Downloading...")
+        msg = await update.message.reply_text("📥 Downloading image...")
         try:
             photo = update.message.photo[-1]
             file = await context.bot.get_file(photo.file_id)
-            path = config.TEMP_DIR / f"{user_id}_image.jpg"
+            path = config.TEMP_DIR / f"{user_id}_image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             await file.download_to_drive(path)
             
             keyboard = [
                 [InlineKeyboardButton("📤 Extraction", callback_data="mode_extraction")],
                 [InlineKeyboardButton("✨ Generation", callback_data="mode_generation")]
             ]
-            self.user_states[user_id] = {'content_type': 'images', 'content_paths': [path]}
-            await msg.edit_text("🖼️ Choose mode:", reply_markup=InlineKeyboardMarkup(keyboard))
+            self.user_states[user_id] = {
+                'content_type': 'images',
+                'content_paths': [path]
+            }
+            await msg.edit_text(
+                "🖼️ *Image Received!*\n\nChoose mode:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
         except Exception as e:
             await msg.edit_text(f"❌ Error: {e}")
     
@@ -532,5 +572,12 @@ class BotHandlers:
         }
         
         pos = task_queue.add_task(user_id, task_data)
-        msg = "❌ Queue full." if pos == -1 else "⚠️ Already queued." if pos == -2 else f"✅ Queued! Position: {pos}"
-        await context.bot.send_message(user_id, msg)
+        
+        if pos == -1:
+            msg = "❌ Queue full. Please try again later."
+        elif pos == -2:
+            msg = "⚠️ You already have a task queued or processing.\nUse `/cancel` to clear."
+        else:
+            msg = f"✅ Added to queue!\n📋 Position: {pos}"
+        
+        await context.bot.send_message(user_id, msg, parse_mode='Markdown')
