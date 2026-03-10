@@ -1,5 +1,5 @@
 """
-Authentication utilities - FIXED: Safe poll answer handling
+Authentication utilities - FIXED: Handle instance methods
 Decorators for requiring authorization and sudo access
 """
 
@@ -13,6 +13,10 @@ def _get_user_id(update: Update):
     Safely extract user ID from various update types
     Returns None if user ID cannot be determined (e.g., channel posts)
     """
+    # Check if update is actually an Update object
+    if not isinstance(update, Update):
+        return None
+    
     # Regular message or callback from user
     if update.effective_user:
         return update.effective_user.id
@@ -29,9 +33,24 @@ def _get_user_id(update: Update):
     return None
 
 def require_auth(func):
-    """Decorator to require authentication"""
+    """Decorator to require authentication - handles both functions and instance methods"""
     @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+    async def wrapper(*args, **kwargs):
+        # Handle instance methods: args[0] might be 'self'
+        # Find the Update object in arguments
+        update = None
+        context = None
+        
+        for arg in args:
+            if isinstance(arg, Update):
+                update = arg
+            elif isinstance(arg, ContextTypes.DEFAULT_TYPE):
+                context = arg
+        
+        # If no Update found in args, it might not be a handler
+        if update is None:
+            return await func(*args, **kwargs)
+        
         user_id = _get_user_id(update)
         
         # Skip auth check if user_id cannot be determined
@@ -41,7 +60,7 @@ def require_auth(func):
         # Check authorization
         if not db.is_authorized(user_id):
             # Only send message if it's a regular message/callback (not poll answer)
-            if update.message or update.callback_query:
+            if context and (update.message or update.callback_query):
                 await context.bot.send_message(
                     user_id,
                     "🔒 *Access Denied*\n\nYou are not authorized to use this bot.\nContact an administrator.",
@@ -49,14 +68,29 @@ def require_auth(func):
                 )
             return
         
-        return await func(update, context, *args, **kwargs)
+        return await func(*args, **kwargs)
     
     return wrapper
 
 def require_sudo(func):
-    """Decorator to require sudo access"""
+    """Decorator to require sudo access - handles both functions and instance methods"""
     @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+    async def wrapper(*args, **kwargs):
+        # Handle instance methods: args[0] might be 'self'
+        # Find the Update object in arguments
+        update = None
+        context = None
+        
+        for arg in args:
+            if isinstance(arg, Update):
+                update = arg
+            elif isinstance(arg, ContextTypes.DEFAULT_TYPE):
+                context = arg
+        
+        # If no Update found in args, it might not be a handler
+        if update is None:
+            return await func(*args, **kwargs)
+        
         user_id = _get_user_id(update)
         
         # Skip sudo check if user_id cannot be determined
@@ -66,7 +100,7 @@ def require_sudo(func):
         # Check sudo access
         if not db.is_sudo(user_id):
             # Only send message if it's a regular message/callback (not poll answer)
-            if update.message or update.callback_query:
+            if context and (update.message or update.callback_query):
                 await context.bot.send_message(
                     user_id,
                     "🔐 *Admin Access Required*\n\nThis command is only available to administrators.",
@@ -74,6 +108,6 @@ def require_sudo(func):
                 )
             return
         
-        return await func(update, context, *args, **kwargs)
+        return await func(*args, **kwargs)
     
     return wrapper
