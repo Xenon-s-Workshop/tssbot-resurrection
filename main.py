@@ -20,6 +20,7 @@ from bot.callbacks import CallbackHandlers
 from processors.pdf_processor import PDFProcessor
 from processors.live_quiz import live_quiz_manager
 from utils.queue_manager import task_queue
+from utils.api_rotator import APIRotator
 from bot.content_processor import ContentProcessor
 
 # Logging
@@ -32,7 +33,14 @@ logger = logging.getLogger(__name__)
 class BotApplication:
     def __init__(self):
         self.application = None
-        self.pdf_processor = PDFProcessor()
+        
+        # Create API rotator first
+        self.api_rotator = APIRotator(config.GEMINI_API_KEYS)
+        
+        # Create PDF processor with API rotator
+        self.pdf_processor = PDFProcessor(self.api_rotator)
+        
+        # Create handlers
         self.bot_handlers = BotHandlers(self.pdf_processor)
         self.callback_handlers = CallbackHandlers(self.bot_handlers)
         self.content_processor = ContentProcessor(self.bot_handlers)
@@ -151,6 +159,7 @@ class BotApplication:
         logger.info(f"🚀 Starting {config.BOT_NAME}")
         logger.info(f"   Model: {config.GEMINI_MODEL}")
         logger.info(f"   Auth: {'Enabled' if config.AUTH_ENABLED else 'Disabled'}")
+        logger.info(f"   API Keys: {len(config.GEMINI_API_KEYS)}")
         
         # Build application
         self.application = (
