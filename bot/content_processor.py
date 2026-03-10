@@ -9,6 +9,7 @@ After processing completes, automatically generates and sends:
 import json
 import asyncio
 from datetime import datetime
+from typing import List, Dict
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import config
 from database import db
