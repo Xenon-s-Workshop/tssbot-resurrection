@@ -1,6 +1,11 @@
 """
-Main Bot Entry Point - GHOST BUG ELIMINATED
-Guaranteed cleanup in ALL cases including errors
+Main Bot Entry Point - COMPLETE & UPDATED
+Features:
+- Ghost bug eliminated with guaranteed cleanup
+- Poll collector integration
+- Live quiz support
+- Queue processing with timeout handling
+- Bengali font support
 """
 
 import asyncio
@@ -18,6 +23,7 @@ from database import db
 from bot.handlers import BotHandlers
 from bot.callbacks import CallbackHandlers
 from processors.pdf_processor import PDFProcessor
+from processors.poll_collector import poll_collector
 from processors.live_quiz import live_quiz_manager
 from utils.queue_manager import task_queue
 from utils.api_rotator import GeminiAPIRotator
@@ -35,28 +41,37 @@ class BotApplication:
         self.application = None
         
         # Create Gemini API rotator first
+        logger.info("🔑 Initializing Gemini API rotator...")
         self.api_rotator = GeminiAPIRotator(config.GEMINI_API_KEYS)
         
         # Create PDF processor with API rotator
+        logger.info("📄 Initializing PDF processor...")
         self.pdf_processor = PDFProcessor(self.api_rotator)
         
         # Create handlers
+        logger.info("🎮 Initializing handlers...")
         self.bot_handlers = BotHandlers(self.pdf_processor)
         self.callback_handlers = CallbackHandlers(self.bot_handlers)
         self.content_processor = ContentProcessor(self.bot_handlers)
+        
+        logger.info("✅ All components initialized")
     
     def setup_handlers(self):
         """Setup all handlers"""
         app = self.application
         
-        # Commands
+        # Commands - Basic
         app.add_handler(CommandHandler("start", self.bot_handlers.start))
         app.add_handler(CommandHandler("help", self.bot_handlers.help_command))
         app.add_handler(CommandHandler("settings", self.bot_handlers.settings_command))
         app.add_handler(CommandHandler("info", self.bot_handlers.info_command))
         app.add_handler(CommandHandler("model", self.bot_handlers.model_command))
+        
+        # Commands - Queue
         app.add_handler(CommandHandler("queue", self.bot_handlers.queue_command))
         app.add_handler(CommandHandler("cancel", self.bot_handlers.cancel_command))
+        
+        # Commands - Features
         app.add_handler(CommandHandler("collectpolls", self.bot_handlers.collectpolls_command))
         app.add_handler(CommandHandler("livequiz", self.bot_handlers.livequiz_command))
         
@@ -65,7 +80,7 @@ class BotApplication:
         app.add_handler(CommandHandler("revoke", self.bot_handlers.revoke_command))
         app.add_handler(CommandHandler("users", self.bot_handlers.users_command))
         
-        # Callbacks
+        # Callbacks (handles all button presses)
         app.add_handler(CallbackQueryHandler(self.callback_handlers.handle_callback))
         
         # Messages
@@ -149,17 +164,29 @@ class BotApplication:
         """Initialize after application start"""
         logger.info("🤖 Bot initialization started")
         
+        # ===== CONNECT POLL COLLECTOR TO APPLICATION =====
+        poll_collector.set_application(application)
+        logger.info("✅ Poll collector connected")
+        
         # Start queue processor
         asyncio.create_task(self.process_queue())
+        logger.info("✅ Queue processor started")
         
-        logger.info("✅ Bot fully initialized")
+        logger.info("✅ Bot fully initialized and ready!")
     
     def run(self):
         """Run the bot"""
+        logger.info("=" * 60)
         logger.info(f"🚀 Starting {config.BOT_NAME}")
+        logger.info("=" * 60)
+        logger.info(f"📋 Configuration:")
         logger.info(f"   Model: {config.GEMINI_MODEL}")
-        logger.info(f"   Auth: {'Enabled' if config.AUTH_ENABLED else 'Disabled'}")
         logger.info(f"   API Keys: {len(config.GEMINI_API_KEYS)}")
+        logger.info(f"   Auth: {'Enabled' if config.AUTH_ENABLED else 'Disabled'}")
+        logger.info(f"   Sudo Users: {len(config.SUDO_USER_IDS)}")
+        logger.info(f"   Max Queue: {config.MAX_QUEUE_SIZE}")
+        logger.info(f"   Workers: {config.MAX_CONCURRENT_IMAGES}")
+        logger.info("=" * 60)
         
         # Build application
         self.application = (
@@ -173,9 +200,24 @@ class BotApplication:
         self.setup_handlers()
         
         # Run
-        logger.info("✅ Bot is ready!")
-        self.application.run_polling(allowed_updates=['message', 'callback_query', 'poll_answer'])
+        logger.info("✅ Bot is ready and listening for updates!")
+        logger.info("=" * 60)
+        
+        try:
+            self.application.run_polling(
+                allowed_updates=['message', 'callback_query', 'poll_answer'],
+                drop_pending_updates=True
+            )
+        except KeyboardInterrupt:
+            logger.info("🛑 Bot stopped by user")
+        except Exception as e:
+            logger.error(f"❌ Fatal error: {e}", exc_info=True)
+            raise
 
 if __name__ == "__main__":
-    bot = BotApplication()
-    bot.run()
+    try:
+        bot = BotApplication()
+        bot.run()
+    except Exception as e:
+        logger.error(f"❌ Failed to start bot: {e}", exc_info=True)
+        exit(1)
