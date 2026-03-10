@@ -1,11 +1,12 @@
 """
-Authentication utilities - FIXED: Handle instance methods
+Authentication utilities - FIXED: Proper type checking for context
 Decorators for requiring authorization and sudo access
 """
 
 from functools import wraps
 from telegram import Update
 from telegram.ext import ContextTypes
+from telegram.ext._utils.types import CCT
 from database import db
 
 def _get_user_id(update: Update):
@@ -37,14 +38,15 @@ def require_auth(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
         # Handle instance methods: args[0] might be 'self'
-        # Find the Update object in arguments
+        # Find the Update and Context objects in arguments
         update = None
         context = None
         
         for arg in args:
             if isinstance(arg, Update):
                 update = arg
-            elif isinstance(arg, ContextTypes.DEFAULT_TYPE):
+            # Check for context by checking if it has 'bot' attribute
+            elif hasattr(arg, 'bot') and hasattr(arg, 'user_data'):
                 context = arg
         
         # If no Update found in args, it might not be a handler
@@ -77,14 +79,15 @@ def require_sudo(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
         # Handle instance methods: args[0] might be 'self'
-        # Find the Update object in arguments
+        # Find the Update and Context objects in arguments
         update = None
         context = None
         
         for arg in args:
             if isinstance(arg, Update):
                 update = arg
-            elif isinstance(arg, ContextTypes.DEFAULT_TYPE):
+            # Check for context by checking if it has 'bot' attribute
+            elif hasattr(arg, 'bot') and hasattr(arg, 'user_data'):
                 context = arg
         
         # If no Update found in args, it might not be a handler
