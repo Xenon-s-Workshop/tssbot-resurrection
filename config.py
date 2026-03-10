@@ -12,7 +12,7 @@ class Config:
     OUTPUT_DIR = Path("output")
     MAX_CONCURRENT_IMAGES = 10
     MAX_QUEUE_SIZE = 20
-    GEMINI_MODEL = "gemini-2.0-flash-exp"
+    GEMINI_MODEL = "gemini-2.0-flash"
     POLL_DELAY = 1.5
     BATCH_SIZE = 30
     BATCH_DELAY = 5
