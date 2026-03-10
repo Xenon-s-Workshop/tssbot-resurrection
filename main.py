@@ -20,7 +20,7 @@ from bot.callbacks import CallbackHandlers
 from processors.pdf_processor import PDFProcessor
 from processors.live_quiz import live_quiz_manager
 from utils.queue_manager import task_queue
-from utils.api_rotator import APIRotator
+from utils.api_rotator import GeminiAPIRotator
 from bot.content_processor import ContentProcessor
 
 # Logging
@@ -34,8 +34,8 @@ class BotApplication:
     def __init__(self):
         self.application = None
         
-        # Create API rotator first
-        self.api_rotator = APIRotator(config.GEMINI_API_KEYS)
+        # Create Gemini API rotator first
+        self.api_rotator = GeminiAPIRotator(config.GEMINI_API_KEYS)
         
         # Create PDF processor with API rotator
         self.pdf_processor = PDFProcessor(self.api_rotator)
