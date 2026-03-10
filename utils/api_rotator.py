@@ -1,14 +1,15 @@
 """
-API Key Rotator - Rotates through multiple Gemini API keys
-Handles rate limiting by switching keys
+API Key Rotator - NEW Google Gen AI SDK (2025)
+Uses the unified google-genai SDK instead of deprecated google-generativeai
 """
 
 import time
 from typing import List
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 class GeminiAPIRotator:
-    """Rotator specifically for Gemini API keys"""
+    """Rotator for Gemini API keys using the new Google Gen AI SDK"""
     
     def __init__(self, api_keys: List[str]):
         """
@@ -25,26 +26,27 @@ class GeminiAPIRotator:
         self.key_failures = {key: 0 for key in self.api_keys}
         self.last_rotation = time.time()
         
-        # Configure first key
-        genai.configure(api_key=self.get_current_key())
+        # Create initial client with first key
+        self.client = genai.Client(api_key=self.get_current_key())
         
         print(f"✅ Gemini API Rotator initialized with {len(self.api_keys)} keys")
+        print(f"✅ Using NEW Google Gen AI SDK (google-genai)")
     
     def get_current_key(self) -> str:
         """Get current API key"""
         return self.api_keys[self.current_index]
     
-    def configure_current_key(self):
-        """Configure Gemini with current API key"""
-        genai.configure(api_key=self.get_current_key())
+    def get_client(self) -> genai.Client:
+        """Get current Gemini client"""
+        return self.client
     
     def rotate(self):
-        """Rotate to next API key and configure it"""
+        """Rotate to next API key and create new client"""
         self.current_index = (self.current_index + 1) % len(self.api_keys)
         self.last_rotation = time.time()
         
-        # Configure new key
-        genai.configure(api_key=self.get_current_key())
+        # Create new client with new key
+        self.client = genai.Client(api_key=self.get_current_key())
         
         print(f"🔄 Rotated to Gemini API key #{self.current_index + 1}/{len(self.api_keys)}")
     
