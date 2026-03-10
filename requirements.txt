@@ -1,6 +1,6 @@
-python-telegram-bot==20.7
-google-genai==0.3.0
-pdf2image==1.17.0
-Pillow==10.2.0
-pymongo==4.6.1
-reportlab==4.0.7
+python-telegram-bot
+google-genai
+pdf2image
+Pillow
+pymongo
+reportlab
