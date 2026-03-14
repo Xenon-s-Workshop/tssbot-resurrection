@@ -1,15 +1,17 @@
 """
-Content Processor - WITH AUTO FILE GENERATION
+Content Processor - WITH AUTO FILE GENERATION & ERROR REPORTING
 After processing completes, automatically generates and sends:
 1. CSV file
 2. JSON file
 3. PDF file (beautiful format)
+
+NOW WITH: User error messages sent to Telegram
 """
 
 import json
 import asyncio
-from datetime import datetime
 from typing import List, Dict
+from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import config
 from database import db
@@ -23,20 +25,47 @@ class ContentProcessor:
         self.bot_handlers = bot_handlers
 
     async def process_content(self, user_id, content_type, content_paths, page_range, mode, context):
-        """Process content and AUTO-GENERATE 3 files"""
+        """Process content and AUTO-GENERATE 3 files - WITH ERROR REPORTING"""
         try:
             # Convert to images
             if content_type == 'pdf':
                 msg = await context.bot.send_message(
                     user_id,
-                    f"🔄 Processing PDF...\n📄 Pages: {'All' if not page_range else f'{page_range[0]}-{page_range[1]}'}"
+                    f"🔄 *Processing PDF...*\n📄 Pages: {'All' if not page_range else f'{page_range[0]}-{page_range[1]}'}\n\n"
+                    f"Using model: `{config.GEMINI_MODEL}`",
+                    parse_mode='Markdown'
                 )
-                images = await PDFProcessor.pdf_to_images(content_paths[0], page_range)
+                
+                try:
+                    images = await PDFProcessor.pdf_to_images(content_paths[0], page_range)
+                except Exception as e:
+                    await msg.edit_text(
+                        f"❌ *PDF Conversion Failed*\n\n"
+                        f"Could not convert PDF to images.\n"
+                        f"Error: `{str(e)[:200]}`",
+                        parse_mode='Markdown'
+                    )
+                    return
             else:
                 msg = await context.bot.send_message(user_id, "🔄 Processing images...")
                 images = [await ImageProcessor.load_image(p) for p in content_paths]
 
             total = len(images)
+            
+            if total == 0:
+                await msg.edit_text(
+                    "❌ *No Images Found*\n\n"
+                    "Could not extract any images from the PDF.",
+                    parse_mode='Markdown'
+                )
+                return
+
+            await context.bot.send_message(
+                user_id,
+                f"✅ *Extracted {total} images*\n"
+                f"🤖 Starting AI processing...",
+                parse_mode='Markdown'
+            )
 
             # Progress callback
             async def progress(current, total_pages):
@@ -56,11 +85,37 @@ class ContentProcessor:
             # Get processor based on user settings
             processor = self.bot_handlers.get_processor(user_id)
             
-            # Process images
-            questions = await processor.process_images_parallel(images, mode, progress)
+            # Process images - WITH ERROR REPORTING
+            try:
+                questions = await processor.process_images_parallel(
+                    images, 
+                    mode, 
+                    progress,
+                    user_id=user_id,    # ← PASS USER ID FOR ERROR REPORTING
+                    context=context      # ← PASS CONTEXT FOR ERROR REPORTING
+                )
+            except Exception as e:
+                await context.bot.send_message(
+                    user_id,
+                    f"❌ *AI Processing Failed*\n\n"
+                    f"Error: `{str(e)[:200]}`\n\n"
+                    f"💡 Check if your API keys are valid:\n"
+                    f"https://aistudio.google.com/apikey",
+                    parse_mode='Markdown'
+                )
+                raise
 
             if not questions:
-                await msg.edit_text("❌ No questions found.")
+                await msg.edit_text(
+                    "❌ *No Questions Found*\n\n"
+                    "The AI couldn't extract any questions.\n\n"
+                    "💡 *Possible reasons:*\n"
+                    "• Image quality too low\n"
+                    "• No questions in the image\n"
+                    "• API key issue\n\n"
+                    "Check messages above for details.",
+                    parse_mode='Markdown'
+                )
                 return
 
             # Store in session
@@ -74,7 +129,7 @@ class ContentProcessor:
             }
 
             await msg.edit_text(
-                f"✅ Processing complete!\n\n"
+                f"✅ *Processing complete!*\n\n"
                 f"📊 Questions: {len(questions)}\n"
                 f"📦 Generating files..."
             )
@@ -89,7 +144,15 @@ class ContentProcessor:
 
         except Exception as e:
             print(f"❌ Error processing: {e}")
-            await context.bot.send_message(user_id, f"❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            await context.bot.send_message(
+                user_id,
+                f"❌ *Processing Error*\n\n"
+                f"`{str(e)[:200]}`",
+                parse_mode='Markdown'
+            )
             raise
 
     async def auto_generate_files(self, user_id: int, questions: List, timestamp: str, context, progress_msg):
@@ -194,12 +257,12 @@ class ContentProcessor:
                 )
             
             # Send PDF with action buttons
+            session_id = self.bot_handlers.user_states[user_id]['session_id']
+            
             keyboard = [
                 [InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")],
                 [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")]
             ]
-            
-            session_id = self.bot_handlers.user_states[user_id]['session_id']
             
             with open(pdf_path, 'rb') as f:
                 await context.bot.send_document(
@@ -230,6 +293,9 @@ class ContentProcessor:
             
         except Exception as e:
             print(f"❌ Error generating files: {e}")
+            import traceback
+            traceback.print_exc()
+            
             await progress_msg.edit_text(
                 f"⚠️ **Files Generated with Errors**\n\n"
                 f"Some files may be missing.\n"
