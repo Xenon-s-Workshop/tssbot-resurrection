@@ -1,7 +1,6 @@
 """
 Live Quiz System - WITH LEADERBOARD
 Sequential quiz posting with real-time scoring and automatic winner announcement
-Based on reference implementation
 """
 
 import asyncio
@@ -73,6 +72,7 @@ class LiveQuizManager:
                         chat_id=session['chat_id'],
                         text=session['custom_message']
                     )
+                    await asyncio.sleep(2)  # Pause after announcement
                 except Exception as e:
                     print(f"⚠️ Could not send custom message: {e}")
             
