@@ -1,20 +1,20 @@
 """
 Bot Callbacks - COMPLETE HANDLER
-Handles all button callbacks including live quiz
+Handles all button callbacks including live quiz, poll collection, settings
 """
 
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from database import db
 from processors.poll_collector import poll_collector
 from processors.pdf_exporter import pdf_exporter
 from processors.live_quiz import live_quiz_manager
-import asyncio
 
 class CallbackHandlers:
     def __init__(self, bot_handlers):
         self.bot_handlers = bot_handlers
-        self.custom_message_sessions = {}  # {user_id: {session_id, waiting}}
+        self.custom_message_sessions = {}  # {user_id: {session_id, waiting, custom_message}}
     
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Main callback router"""
@@ -22,6 +22,8 @@ class CallbackHandlers:
         await query.answer()
         user_id = update.effective_user.id
         data = query.data
+        
+        print(f"🔘 Callback from user {user_id}: {data}")
         
         # ==================== POLL COLLECTION ====================
         if data == "poll_export_csv":
@@ -108,7 +110,7 @@ class CallbackHandlers:
                 await query.answer("❌ No questions!")
                 return
             
-            # Ask for custom message
+            # Store session for custom message
             self.custom_message_sessions[user_id] = {
                 'session_id': session_id,
                 'waiting_for': 'custom_message',
@@ -118,7 +120,14 @@ class CallbackHandlers:
             
             keyboard = [[InlineKeyboardButton("⏭️ Skip Message", callback_data=f"livequiz_skip_{session_id}")]]
             
-            await query.edit_message_text(
+            # Delete old message and send new one
+            try:
+                await query.message.delete()
+            except:
+                pass
+            
+            await context.bot.send_message(
+                user_id,
                 "🎯 *Live Quiz Setup*\n\n"
                 "📝 Send a custom announcement message\n"
                 "or skip to start immediately.\n\n"
@@ -136,6 +145,12 @@ class CallbackHandlers:
             session_data = self.custom_message_sessions.pop(user_id)
             questions = session_data['questions']
             
+            # Delete old message
+            try:
+                await query.message.delete()
+            except:
+                pass
+            
             # Create and run quiz
             quiz_session_id = live_quiz_manager.create_session(
                 update.effective_chat.id,
@@ -144,7 +159,8 @@ class CallbackHandlers:
                 None  # No custom message
             )
             
-            await query.edit_message_text(
+            await context.bot.send_message(
+                user_id,
                 f"✅ *Live Quiz Started!*\n\n"
                 f"📊 Questions: {len(questions)}\n"
                 f"⏱️ Time: 10s each\n\n"
@@ -170,7 +186,7 @@ class CallbackHandlers:
                 await query.edit_message_text("❌ No destinations. Use /settings")
                 return
             
-            # Ask for custom message first
+            # Store session for custom message
             self.custom_message_sessions[user_id] = {
                 'session_id': session_id,
                 'waiting_for': 'custom_message',
@@ -179,7 +195,14 @@ class CallbackHandlers:
             
             keyboard = [[InlineKeyboardButton("⏭️ Skip Message", callback_data=f"post_skip_{session_id}")]]
             
-            await query.edit_message_text(
+            # Delete old message and send new one
+            try:
+                await query.message.delete()
+            except:
+                pass
+            
+            await context.bot.send_message(
+                user_id,
                 "📢 *Quiz Posting Setup*\n\n"
                 "📝 Send a custom announcement message\n"
                 "or skip to post without message.\n\n"
@@ -195,21 +218,30 @@ class CallbackHandlers:
             if user_id in self.custom_message_sessions:
                 self.custom_message_sessions[user_id]['custom_message'] = None
             
-            await self._show_destination_selection(user_id, query, context)
+            # Delete old message
+            try:
+                await query.message.delete()
+            except:
+                pass
+            
+            # Send fresh destination selection
+            await self._send_destination_selection(user_id, context)
         
         elif data.startswith("dest_ch_"):
             channel_id = int(data.split("_")[-1])
-            await query.edit_message_text("📺 Posting to channel...")
             
             # Get custom message if exists
             custom_msg = None
             if user_id in self.custom_message_sessions:
                 custom_msg = self.custom_message_sessions.pop(user_id).get('custom_message')
             
+            # Send posting status
+            msg = await context.bot.send_message(user_id, "📺 Posting to channel...")
+            
             from bot.content_processor import ContentProcessor
             processor = ContentProcessor(self.bot_handlers)
             await processor.post_quizzes_to_destination(
-                user_id, channel_id, None, context, query.message, custom_msg
+                user_id, channel_id, None, context, msg, custom_msg
             )
         
         elif data.startswith("dest_gr_"):
@@ -224,7 +256,8 @@ class CallbackHandlers:
                 session_data = self.custom_message_sessions.pop(user_id)
                 self.bot_handlers.user_states[user_id]['custom_message'] = session_data.get('custom_message')
             
-            await query.edit_message_text(
+            await context.bot.send_message(
+                user_id,
                 "🔢 *Topic ID*\n\n"
                 "Send topic ID or 0 for none:",
                 parse_mode='Markdown'
@@ -282,10 +315,12 @@ class CallbackHandlers:
         elif data.startswith("del_ch_"):
             db.delete_channel(data[7:])
             await query.answer("✅ Channel deleted!")
+            await query.message.delete()
         
         elif data.startswith("del_gr_"):
             db.delete_group(data[7:])
             await query.answer("✅ Group deleted!")
+            await query.message.delete()
     
     # ==================== TEXT INPUT HANDLER ====================
     
@@ -294,19 +329,20 @@ class CallbackHandlers:
         user_id = update.effective_user.id
         text = update.message.text.strip()
         
-        # PDF name input
-        if pdf_exporter.is_waiting_for_name(user_id):
-            await pdf_exporter.handle_pdf_name_input(update, context)
-            return
+        print(f"📝 Text received from user {user_id}: {text[:50]}...")
         
-        # Custom message input for quiz/live quiz
+        # ==================== CUSTOM MESSAGE FOR QUIZ/LIVE QUIZ ====================
         if user_id in self.custom_message_sessions:
             session_data = self.custom_message_sessions[user_id]
+            
+            print(f"📋 Session data: waiting_for={session_data.get('waiting_for')}, type={session_data.get('quiz_type')}")
             
             if session_data.get('waiting_for') == 'custom_message':
                 # Store custom message
                 session_data['custom_message'] = text
                 session_data['waiting_for'] = None
+                
+                print(f"✅ Stored custom message: {text[:50]}...")
                 
                 if session_data['quiz_type'] == 'live':
                     # Start live quiz with custom message
@@ -325,7 +361,7 @@ class CallbackHandlers:
                         f"✅ *Live Quiz Started!*\n\n"
                         f"📊 Questions: {len(questions)}\n"
                         f"⏱️ Time: 10s each\n"
-                        f"📝 Message: \"{text[:50]}...\"\n\n"
+                        f"📝 Message: \"{text[:50]}{'...' if len(text) > 50 else ''}\"\n\n"
                         f"Watch the chat!",
                         parse_mode='Markdown'
                     )
@@ -334,16 +370,33 @@ class CallbackHandlers:
                     asyncio.create_task(live_quiz_manager.run_quiz(quiz_session_id, context))
                 
                 else:  # Regular post
+                    print(f"📢 Showing destination selection for regular post...")
+                    
+                    await update.message.reply_text(
+                        f"✅ *Custom message set:*\n\n"
+                        f"\"{text[:100]}{'...' if len(text) > 100 else ''}\"\n\n"
+                        f"Selecting destination...",
+                        parse_mode='Markdown'
+                    )
+                    
                     # Show destination selection
-                    await self._show_destination_selection(user_id, update, context)
-            
+                    await self._send_destination_selection(user_id, context)
+                
+                return
+        
+        # ==================== PDF NAME INPUT ====================
+        if pdf_exporter.is_waiting_for_name(user_id):
+            print(f"📄 PDF name input from user {user_id}")
+            await pdf_exporter.handle_pdf_name_input(update, context)
             return
         
-        # Regular state handling
+        # ==================== REGULAR STATE HANDLING ====================
         if user_id not in self.bot_handlers.user_states:
+            print(f"⚠️ No state for user {user_id}, ignoring text")
             return
         
         waiting_for = self.bot_handlers.user_states[user_id].get('waiting_for')
+        print(f"📋 User state waiting_for: {waiting_for}")
         
         # ==================== PAGE RANGE INPUT ====================
         if waiting_for == 'page_range':
@@ -370,7 +423,8 @@ class CallbackHandlers:
                     f"✅ Pages {start}-{end}\n\nChoose mode:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-            except:
+            except Exception as e:
+                print(f"❌ Page range error: {e}")
                 await update.message.reply_text("❌ Format: `5-15`", parse_mode='Markdown')
         
         # ==================== SETTINGS INPUT ====================
@@ -384,7 +438,8 @@ class CallbackHandlers:
                 db.add_channel(user_id, int(parts[0]), parts[1])
                 await update.message.reply_text("✅ Channel added!")
                 del self.bot_handlers.user_states[user_id]
-            except:
+            except Exception as e:
+                print(f"❌ Add channel error: {e}")
                 await update.message.reply_text("❌ Invalid ID.")
         
         elif waiting_for == 'add_group':
@@ -397,7 +452,8 @@ class CallbackHandlers:
                 db.add_group(user_id, int(parts[0]), parts[1])
                 await update.message.reply_text("✅ Group added!")
                 del self.bot_handlers.user_states[user_id]
-            except:
+            except Exception as e:
+                print(f"❌ Add group error: {e}")
                 await update.message.reply_text("❌ Invalid ID.")
         
         # ==================== TOPIC ID INPUT ====================
@@ -417,21 +473,26 @@ class CallbackHandlers:
                 )
                 
                 del self.bot_handlers.user_states[user_id]
-            except:
+            except Exception as e:
+                print(f"❌ Topic ID error: {e}")
                 await update.message.reply_text("❌ Invalid topic ID.")
+        
+        else:
+            print(f"⚠️ Unknown waiting_for state: {waiting_for}")
     
     # ==================== HELPER METHODS ====================
     
-    async def _show_destination_selection(self, user_id: int, update, context: ContextTypes.DEFAULT_TYPE):
-        """Show destination selection menu"""
+    async def _send_destination_selection(self, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Send destination selection menu (fresh message)"""
         channels = db.get_user_channels(user_id)
         groups = db.get_user_groups(user_id)
         
         if not channels and not groups:
-            if hasattr(update, 'callback_query'):
-                await update.callback_query.edit_message_text("❌ No destinations. Use /settings")
-            else:
-                await update.message.reply_text("❌ No destinations. Use /settings")
+            await context.bot.send_message(
+                user_id,
+                "❌ No destinations configured.\nUse /settings to add channels or groups."
+            )
+            self.custom_message_sessions.pop(user_id, None)
             return
         
         keyboard = []
@@ -446,17 +507,9 @@ class CallbackHandlers:
                 callback_data=f"dest_gr_{gr['group_id']}"
             )])
         
-        text = "📢 *Select Destination:*"
-        
-        if hasattr(update, 'callback_query'):
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
+        await context.bot.send_message(
+            user_id,
+            "📢 *Select Destination:*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
