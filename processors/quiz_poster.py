@@ -1,7 +1,6 @@
 """
-Quiz Poster - WITH CUSTOM MESSAGE and SUCCESS COUNTER
-Posts quizzes with custom announcement message
-Sends "?/200" format success message to destination
+Quiz Poster - WITH CANCELLATION & CORRECT COUNTER FORMAT
+Posts quizzes and sends "?/200" counter to destination
 """
 
 import asyncio
@@ -11,6 +10,9 @@ from telegram.error import RetryAfter, TimedOut
 from config import config
 
 class QuizPoster:
+    def __init__(self):
+        self.active_postings = {}  # {user_id: {'cancel': bool}}
+    
     @staticmethod
     def format_question(text: str, marker: str) -> str:
         """Format question with marker"""
@@ -60,8 +62,8 @@ class QuizPoster:
                 return False
         return False
     
-    @staticmethod
     async def post_quizzes_batch(
+        self,
         context,
         chat_id,
         questions,
@@ -69,36 +71,38 @@ class QuizPoster:
         tag,
         thread_id=None,
         progress_callback=None,
-        custom_message=None
+        custom_message=None,
+        user_id=None
     ):
         """
-        Post quizzes with custom message and success counter
-        
-        Args:
-            custom_message: Custom announcement message to send first
-            
-        Returns success counter in format: sent/total
+        Post quizzes with custom message
+        Sends "?/total" counter to destination (e.g., "145/200")
         """
         total = len(questions)
         success = failed = skipped = 0
         
-        # Send custom message if provided
-        if custom_message:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=custom_message,
-                    message_thread_id=thread_id
-                )
-                print(f"✅ Sent custom message: {custom_message[:50]}...")
-            except Exception as e:
-                print(f"⚠️ Could not send custom message: {e}")
+        # Register posting session
+        if user_id:
+            self.active_postings[user_id] = {'cancel': False}
+        
+        # Custom message is now sent and pinned in content_processor
+        # Don't send it again here
         
         # Post quizzes
         for i in range(0, total, config.BATCH_SIZE):
+            # Check for cancellation
+            if user_id and self.active_postings.get(user_id, {}).get('cancel'):
+                print(f"🛑 Posting cancelled by user {user_id}")
+                break
+            
             batch = questions[i:i + config.BATCH_SIZE]
             
             for idx, q in enumerate(batch):
+                # Check cancellation again
+                if user_id and self.active_postings.get(user_id, {}).get('cancel'):
+                    print(f"🛑 Posting cancelled by user {user_id}")
+                    break
+                
                 global_idx = i + idx + 1
                 
                 # Update progress
@@ -111,7 +115,7 @@ class QuizPoster:
                     continue
                 
                 # Send quiz
-                if await QuizPoster.send_quiz_with_retry(context, chat_id, q, marker, tag, thread_id):
+                if await self.send_quiz_with_retry(context, chat_id, q, marker, tag, thread_id):
                     success += 1
                 else:
                     failed += 1
@@ -120,11 +124,16 @@ class QuizPoster:
                 if global_idx < total:
                     await asyncio.sleep(config.POLL_DELAY)
             
+            # Check if cancelled before batch delay
+            if user_id and self.active_postings.get(user_id, {}).get('cancel'):
+                break
+            
             # Delay between batches
             if i + config.BATCH_SIZE < total:
                 await asyncio.sleep(config.BATCH_DELAY)
         
-        # Send success counter to destination in format: "?/200"
+        # ===== SEND COUNTER IN FORMAT: ?/total =====
+        # Example: "145/200" means 145 quizzes sent successfully out of 200 total
         try:
             counter_message = f"{success}/{total}"
             await context.bot.send_message(
@@ -132,9 +141,13 @@ class QuizPoster:
                 text=counter_message,
                 message_thread_id=thread_id
             )
-            print(f"✅ Sent success counter: {counter_message}")
+            print(f"✅ Sent counter to destination: {counter_message}")
         except Exception as e:
             print(f"⚠️ Could not send counter: {e}")
+        
+        # Cleanup posting session
+        if user_id and user_id in self.active_postings:
+            del self.active_postings[user_id]
         
         return {
             'total': total,
@@ -142,3 +155,14 @@ class QuizPoster:
             'failed': failed,
             'skipped': skipped
         }
+    
+    def cancel_posting(self, user_id: int):
+        """Cancel active posting for user"""
+        if user_id in self.active_postings:
+            self.active_postings[user_id]['cancel'] = True
+            print(f"🛑 Marked posting for user {user_id} for cancellation")
+            return True
+        return False
+
+# Global instance
+quiz_poster = QuizPoster()
