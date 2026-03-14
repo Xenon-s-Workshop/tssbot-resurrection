@@ -1,11 +1,9 @@
 """
-Content Processor - WITH AUTO FILE GENERATION & ERROR REPORTING
-After processing completes, automatically generates and sends:
-1. CSV file
-2. JSON file
-3. PDF file (beautiful format)
-
-NOW WITH: User error messages sent to Telegram
+Content Processor - COMPLETE & FIXED
+- Auto-generates 3 files
+- Single edited message (no spam)
+- Correct question format
+- Error reporting
 """
 
 import json
@@ -17,7 +15,7 @@ from config import config
 from database import db
 from processors.csv_processor import CSVGenerator
 from processors.image_processor import ImageProcessor
-from processors.quiz_poster import QuizPoster
+from processors.quiz_poster import quiz_poster
 from processors.pdf_processor import PDFProcessor
 
 class ContentProcessor:
@@ -26,6 +24,8 @@ class ContentProcessor:
 
     async def process_content(self, user_id, content_type, content_paths, page_range, mode, context):
         """Process content and AUTO-GENERATE 3 files - WITH ERROR REPORTING"""
+        msg = None
+        
         try:
             # Convert to images
             if content_type == 'pdf':
@@ -60,14 +60,13 @@ class ContentProcessor:
                 )
                 return
 
-            await context.bot.send_message(
-                user_id,
+            await msg.edit_text(
                 f"✅ *Extracted {total} images*\n"
                 f"🤖 Starting AI processing...",
                 parse_mode='Markdown'
             )
 
-            # Progress callback
+            # Progress callback - EDIT SINGLE MESSAGE
             async def progress(current, total_pages):
                 try:
                     pct = int((current / total_pages) * 100)
@@ -82,21 +81,20 @@ class ContentProcessor:
                 except:
                     pass
 
-            # Get processor based on user settings
+            # Get processor
             processor = self.bot_handlers.get_processor(user_id)
             
             # Process images - WITH ERROR REPORTING
             try:
-                questions = await processor.process_images_parallel(
+                raw_questions = await processor.process_images_parallel(
                     images, 
                     mode, 
                     progress,
-                    user_id=user_id,    # ← PASS USER ID FOR ERROR REPORTING
-                    context=context      # ← PASS CONTEXT FOR ERROR REPORTING
+                    user_id=user_id,
+                    context=context
                 )
             except Exception as e:
-                await context.bot.send_message(
-                    user_id,
+                await msg.edit_text(
                     f"❌ *AI Processing Failed*\n\n"
                     f"Error: `{str(e)[:200]}`\n\n"
                     f"💡 Check if your API keys are valid:\n"
@@ -105,7 +103,7 @@ class ContentProcessor:
                 )
                 raise
 
-            if not questions:
+            if not raw_questions:
                 await msg.edit_text(
                     "❌ *No Questions Found*\n\n"
                     "The AI couldn't extract any questions.\n\n"
@@ -117,6 +115,9 @@ class ContentProcessor:
                     parse_mode='Markdown'
                 )
                 return
+
+            # ===== FIX QUESTION FORMAT FOR POSTING =====
+            questions = self._normalize_questions(raw_questions)
 
             # Store in session
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -131,7 +132,8 @@ class ContentProcessor:
             await msg.edit_text(
                 f"✅ *Processing complete!*\n\n"
                 f"📊 Questions: {len(questions)}\n"
-                f"📦 Generating files..."
+                f"📦 Generating files...",
+                parse_mode='Markdown'
             )
 
             # ===== AUTO-GENERATE 3 FILES =====
@@ -147,41 +149,105 @@ class ContentProcessor:
             import traceback
             traceback.print_exc()
             
-            await context.bot.send_message(
-                user_id,
-                f"❌ *Processing Error*\n\n"
-                f"`{str(e)[:200]}`",
-                parse_mode='Markdown'
-            )
+            if msg:
+                await msg.edit_text(
+                    f"❌ *Processing Error*\n\n"
+                    f"`{str(e)[:200]}`",
+                    parse_mode='Markdown'
+                )
             raise
 
+    def _normalize_questions(self, raw_questions: List[Dict]) -> List[Dict]:
+        """
+        Normalize questions to format expected by quiz_poster
+        
+        Input format (from Gemini):
+        {
+            'question': str,
+            'options': {'A': str, 'B': str, ...},
+            'correct_answer': 'A',
+            'explanation': str
+        }
+        
+        Output format (for posting):
+        {
+            'question_description': str,
+            'options': [str, str, ...],
+            'correct_answer_index': int,
+            'correct_option': str,
+            'explanation': str
+        }
+        """
+        normalized = []
+        
+        for q in raw_questions:
+            # Get options as list
+            opts_dict = q.get('options', {})
+            options = []
+            for letter in ['A', 'B', 'C', 'D', 'E']:
+                opt = opts_dict.get(letter)
+                if opt:
+                    options.append(opt)
+            
+            # Get correct answer index
+            correct_letter = q.get('correct_answer', 'A').upper()
+            correct_idx = ord(correct_letter) - ord('A')
+            
+            # Ensure index is valid
+            if correct_idx < 0 or correct_idx >= len(options):
+                correct_idx = 0
+                correct_letter = 'A'
+            
+            normalized.append({
+                'question_description': q.get('question', ''),
+                'options': options,
+                'correct_answer_index': correct_idx,
+                'correct_option': correct_letter,
+                'explanation': q.get('explanation', '')
+            })
+        
+        return normalized
+
     async def auto_generate_files(self, user_id: int, questions: List, timestamp: str, context, progress_msg):
-        """AUTO-GENERATE and send CSV, JSON, and PDF"""
+        """AUTO-GENERATE and send CSV, JSON, and PDF - EDIT SINGLE MESSAGE"""
         
         try:
-            # Update progress
+            # ===== 1. GENERATE CSV =====
             await progress_msg.edit_text(
-                f"✅ Processing complete!\n\n"
-                f"📊 Questions: {len(questions)}\n\n"
-                f"📦 Generating files:\n"
+                f"📦 *Generating files...*\n\n"
                 f"⏳ CSV...",
                 parse_mode='Markdown'
             )
             
-            # ===== 1. GENERATE CSV =====
             csv_path = config.OUTPUT_DIR / f"questions_{timestamp}.csv"
-            CSVGenerator.questions_to_csv(questions, csv_path)
             
+            # Convert to CSV format
+            csv_questions = []
+            for q in questions:
+                csv_q = {
+                    'questions': q.get('question_description', ''),
+                    'option1': q['options'][0] if len(q['options']) > 0 else '',
+                    'option2': q['options'][1] if len(q['options']) > 1 else '',
+                    'option3': q['options'][2] if len(q['options']) > 2 else '',
+                    'option4': q['options'][3] if len(q['options']) > 3 else '',
+                    'option5': q['options'][4] if len(q['options']) > 4 else '',
+                    'answer': str(q.get('correct_answer_index', 0) + 1),
+                    'explanation': q.get('explanation', ''),
+                    'type': '1',
+                    'section': '1'
+                }
+                csv_questions.append(csv_q)
+            
+            CSVGenerator.questions_to_csv(csv_questions, csv_path)
+            
+            # ===== 2. GENERATE JSON =====
             await progress_msg.edit_text(
-                f"✅ Processing complete!\n\n"
-                f"📊 Questions: {len(questions)}\n\n"
-                f"📦 Generating files:\n"
+                f"📦 *Generating files...*\n\n"
                 f"✅ CSV\n"
                 f"⏳ JSON...",
                 parse_mode='Markdown'
             )
             
-            # ===== 2. GENERATE JSON =====
             json_questions = []
             for q in questions:
                 json_q = {
@@ -191,9 +257,7 @@ class ContentProcessor:
                     'explanation': q.get('explanation', '')
                 }
                 
-                # Add options
-                opts = q.get('options', [])
-                for i, opt in enumerate(opts):
+                for i, opt in enumerate(q['options']):
                     if opt:
                         json_q['options'][chr(65 + i)] = opt
                 
@@ -203,47 +267,39 @@ class ContentProcessor:
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(json_questions, f, ensure_ascii=False, indent=2)
             
+            # ===== 3. GENERATE PDF =====
             await progress_msg.edit_text(
-                f"✅ Processing complete!\n\n"
-                f"📊 Questions: {len(questions)}\n\n"
-                f"📦 Generating files:\n"
+                f"📦 *Generating files...*\n\n"
                 f"✅ CSV\n"
                 f"✅ JSON\n"
-                f"⏳ PDF (beautiful format)...",
+                f"⏳ PDF...",
                 parse_mode='Markdown'
             )
             
-            # ===== 3. GENERATE PDF =====
             from processors.pdf_exporter import pdf_exporter
             
             pdf_title = f"MCQ_Questions_{timestamp}"
             pdf_path = config.OUTPUT_DIR / f"questions_{timestamp}.pdf"
             
-            # Clean questions for PDF
             cleaned = pdf_exporter.cleanup_questions(questions)
-            
-            # Generate beautiful PDF
             pdf_exporter.generate_beautiful_pdf(cleaned, pdf_path, pdf_title)
             
+            # ===== SEND ALL 3 FILES =====
             await progress_msg.edit_text(
-                f"✅ Processing complete!\n\n"
-                f"📊 Questions: {len(questions)}\n\n"
-                f"📦 Files generated:\n"
+                f"📦 *Files generated!*\n\n"
                 f"✅ CSV\n"
                 f"✅ JSON\n"
                 f"✅ PDF\n\n"
-                f"📤 Sending files...",
+                f"📤 Sending...",
                 parse_mode='Markdown'
             )
-            
-            # ===== SEND ALL 3 FILES =====
             
             # Send CSV
             with open(csv_path, 'rb') as f:
                 await context.bot.send_document(
                     user_id, f,
                     filename=f"questions_{timestamp}.csv",
-                    caption="📊 **CSV Format**\nImport to spreadsheets",
+                    caption="📊 **CSV Format**",
                     parse_mode='Markdown'
                 )
             
@@ -252,11 +308,11 @@ class ContentProcessor:
                 await context.bot.send_document(
                     user_id, f,
                     filename=f"questions_{timestamp}.json",
-                    caption="📋 **JSON Format**\nFor quiz systems",
+                    caption="📋 **JSON Format**",
                     parse_mode='Markdown'
                 )
             
-            # Send PDF with action buttons
+            # Send PDF with buttons
             session_id = self.bot_handlers.user_states[user_id]['session_id']
             
             keyboard = [
@@ -268,11 +324,10 @@ class ContentProcessor:
                 await context.bot.send_document(
                     user_id, f,
                     filename=f"questions_{timestamp}.pdf",
-                    caption=f"📄 **PDF Format (Beautiful)**\n"
-                            f"🎨 Blue headers, green answers\n"
-                            f"🌏 Bengali/Unicode supported\n\n"
-                            f"📊 Total: {len(questions)} questions\n\n"
-                            f"Choose action:",
+                    caption=f"📄 **PDF Format**\n"
+                            f"🎨 Beautiful design\n\n"
+                            f"📊 **{len(questions)} questions**\n\n"
+                            f"Ready to post! 🎉",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
@@ -282,14 +337,8 @@ class ContentProcessor:
             json_path.unlink(missing_ok=True)
             pdf_path.unlink(missing_ok=True)
             
-            # Final message
-            await progress_msg.edit_text(
-                f"✅ **All Done!**\n\n"
-                f"📊 Questions: {len(questions)}\n"
-                f"📦 Files sent: CSV, JSON, PDF\n\n"
-                f"Ready to post quizzes! 🎉",
-                parse_mode='Markdown'
-            )
+            # Final message - DELETE instead of edit
+            await progress_msg.delete()
             
         except Exception as e:
             print(f"❌ Error generating files: {e}")
@@ -297,31 +346,55 @@ class ContentProcessor:
             traceback.print_exc()
             
             await progress_msg.edit_text(
-                f"⚠️ **Files Generated with Errors**\n\n"
-                f"Some files may be missing.\n"
-                f"Error: {str(e)[:100]}",
+                f"⚠️ **Error**\n\n{str(e)[:100]}",
                 parse_mode='Markdown'
             )
 
     async def post_quizzes_to_destination(self, user_id, chat_id, thread_id, context, status_msg, custom_message=None):
-        """Post quizzes with custom message and success counter"""
+        """Post quizzes with custom message and pin - EDIT SINGLE MESSAGE"""
         if user_id not in self.bot_handlers.user_states:
             return
 
         questions = self.bot_handlers.user_states[user_id]['questions']
         settings = db.get_user_settings(user_id)
 
-        await status_msg.edit_text(f"📢 Starting: {len(questions)} quizzes...")
+        await status_msg.edit_text(
+            f"📢 *Starting...*\n\n"
+            f"📊 Total: {len(questions)} quizzes",
+            parse_mode='Markdown'
+        )
 
-        # Progress callback
+        # Pin custom message if provided
+        pinned_msg_id = None
+        if custom_message:
+            try:
+                pin_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=custom_message,
+                    message_thread_id=thread_id
+                )
+                # Try to pin
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=chat_id,
+                        message_id=pin_msg.message_id,
+                        disable_notification=True
+                    )
+                    pinned_msg_id = pin_msg.message_id
+                except:
+                    pass  # Might not have permission
+            except Exception as e:
+                print(f"⚠️ Could not send/pin message: {e}")
+
+        # Progress callback - EDIT SINGLE MESSAGE
         async def progress(current, total, success, failed):
             try:
                 pct = int((current / total) * 100)
                 bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 await status_msg.edit_text(
-                    f"📊 *Posting Quizzes...*\n\n"
+                    f"📊 *Posting...*\n\n"
                     f"`[{bar}]` {pct}%\n"
-                    f"Quiz {current}/{total}\n"
+                    f"{current}/{total}\n"
                     f"✅ {success}  ❌ {failed}",
                     parse_mode='Markdown'
                 )
@@ -329,20 +402,21 @@ class ContentProcessor:
                 pass
 
         # Post with custom message
-        result = await QuizPoster.post_quizzes_batch(
+        result = await quiz_poster.post_quizzes_batch(
             context, chat_id, questions,
             settings['quiz_marker'], settings['explanation_tag'],
-            thread_id, progress, custom_message
+            thread_id, progress, None,  # Don't send custom message again
+            user_id=user_id
         )
 
         # Final summary
         await status_msg.edit_text(
-            f"✅ *Posting Complete!*\n\n"
+            f"✅ *Complete!*\n\n"
             f"📊 Total: {result['total']}\n"
             f"✅ Success: {result['success']}\n"
             f"❌ Failed: {result['failed']}\n"
             f"⏭️ Skipped: {result['skipped']}\n\n"
-            f"📤 Success counter sent to destination!",
+            f"📤 Counter sent!",
             parse_mode='Markdown'
         )
 
