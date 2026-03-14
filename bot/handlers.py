@@ -1,583 +1,546 @@
 """
-Bot Handlers - COMPLETE WITH ALL FEATURES
-- Enhanced start command with detailed help
-- Live quiz integration
-- Ghost bug prevention with timeout checks
-- Poll collection
-- File processing
+Bot Handlers - COMPLETE
+All command and file handlers with ghost bug prevention
 """
 
-import re
+import asyncio
+import csv
 import json
-import tempfile
-from datetime import datetime
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from config import config
 from database import db
-from processors.csv_processor import CSVParser
-from processors.poll_collector import poll_collector
-from processors.live_quiz import live_quiz_manager
+from utils.auth import require_auth
 from utils.queue_manager import task_queue
-from utils.auth import require_auth, require_sudo
+from processors.poll_collector import poll_collector
 
 class BotHandlers:
-    def __init__(self, pdf_processor):
-        self.user_states = {}
-        self.pdf_processor = pdf_processor
+    def __init__(self):
+        self.user_states = {}  # {user_id: state_data}
+        self.processors = {}  # {user_id: PDFProcessor instance}
+        print("✅ Bot Handlers initialized")
     
-    def get_processor(self, user_id: int):
-        """Get AI processor (for future dual-AI support)"""
-        return self.pdf_processor
+    def get_processor(self, user_id):
+        """Get or create processor for user"""
+        if user_id not in self.processors:
+            from processors.pdf_processor import PDFProcessor
+            from utils.api_rotator import GeminiAPIRotator
+            
+            api_rotator = GeminiAPIRotator(config.GEMINI_API_KEYS)
+            self.processors[user_id] = PDFProcessor(api_rotator)
+        
+        return self.processors[user_id]
     
-    # ==================== ENHANCED START COMMAND ====================
+    # ==================== COMMAND HANDLERS ====================
     
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Enhanced start command with detailed help"""
-        user_id = update.effective_user.id
-        username = update.effective_user.first_name or "User"
+    @require_auth
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced start command with full feature list"""
+        user = update.effective_user
         
-        if not db.is_authorized(user_id):
-            await update.message.reply_text(
-                f"🔒 *Access Denied*\n\n"
-                f"Contact an administrator for access.",
-                parse_mode='Markdown'
-            )
-            return
+        welcome_msg = (
+            f"👋 **Welcome {user.first_name}!**\n\n"
+            f"🤖 **{config.BOT_NAME}** - Your Quiz Assistant\n\n"
+            f"**📚 Features:**\n"
+            f"• 📄 PDF/Image → MCQ extraction\n"
+            f"• ✨ AI quiz generation\n"
+            f"• 📊 CSV/JSON/PDF export\n"
+            f"• 📢 Auto-posting to channels\n"
+            f"• 🎯 Live quiz with leaderboard\n"
+            f"• 📝 Poll collection & export\n\n"
+            f"**🎮 Commands:**\n"
+            f"• /help - Show all commands\n"
+            f"• /settings - Manage channels/groups\n"
+            f"• /collectpolls - Collect forwarded polls\n"
+            f"• /livequiz - Start live quiz\n"
+            f"• /queue - Check queue status\n"
+            f"• /cancel - Cancel current task\n\n"
+            f"**💡 Quick Start:**\n"
+            f"1️⃣ Send PDF or images\n"
+            f"2️⃣ Choose extraction/generation\n"
+            f"3️⃣ Get CSV, JSON, PDF files\n"
+            f"4️⃣ Post to your channel!\n\n"
+            f"**🔥 Tips:**\n"
+            f"• Clear images = better results\n"
+            f"• Use page ranges for large PDFs\n"
+            f"• Custom messages get auto-pinned\n"
+            f"• Live quiz tracks scores in real-time\n\n"
+            f"Ready to create quizzes! 🚀"
+        )
         
-        is_sudo = db.is_sudo(user_id)
-        
-        welcome = f"👋 *Welcome to {config.BOT_NAME}!*\n\n"
-        welcome += f"Hello {username}! 🎓\n\n"
-        
-        # Features
-        welcome += "✨ *Features:*\n"
-        welcome += "📄 Process PDFs/Images with AI\n"
-        welcome += "📮 Collect Telegram polls\n"
-        welcome += "🎯 Live quiz with leaderboard\n"
-        welcome += "📊 Auto-generate CSV/JSON/PDF\n"
-        welcome += "📢 Post to channels/groups\n"
-        welcome += "🌏 Bengali/Unicode support\n\n"
-        
-        # Commands - Processing
-        welcome += "📋 *Processing Commands:*\n"
-        welcome += "`Send PDF/Images` - AI processing\n"
-        welcome += "`/collectpolls` - Collect polls\n"
-        welcome += "`/queue` - Check queue status\n"
-        welcome += "`/cancel` - Cancel current task\n\n"
-        
-        # Commands - Quiz
-        welcome += "🎯 *Quiz Commands:*\n"
-        welcome += "`/livequiz` - Start live quiz\n"
-        welcome += "Reply to CSV/JSON with options:\n"
-        welcome += "  `-m \"message\"` - Custom announcement\n"
-        welcome += "  `-t 10` - 10 seconds per question\n"
-        welcome += "  `-c -123456` - Post to chat ID\n\n"
-        
-        # Commands - Settings
-        welcome += "⚙️ *Settings:*\n"
-        welcome += "`/settings` - Configure bot\n"
-        welcome += "`/info` - Get chat/topic info\n"
-        welcome += "`/model` - AI model info\n\n"
-        
-        # Admin commands
-        if is_sudo:
-            welcome += "🔐 *Admin Commands:*\n"
-            welcome += "`/authorize <id>` - Add user\n"
-            welcome += "`/revoke <id>` - Remove user\n"
-            welcome += "`/users` - List all users\n\n"
-        
-        # Tips
-        welcome += "💡 *Tips:*\n"
-        welcome += "• PDF processing auto-generates 3 files\n"
-        welcome += "• Poll collection has batch processing\n"
-        welcome += "• Live quiz shows real-time leaderboard\n"
-        welcome += "• Success counter sent after posting\n\n"
-        
-        welcome += "🚀 *Ready to start!*"
-        
-        await update.message.reply_text(welcome, parse_mode='Markdown')
-    
-    # ==================== BASIC COMMANDS ====================
+        await update.message.reply_text(welcome_msg, parse_mode='Markdown')
     
     @require_auth
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Quick help"""
+        """Help command"""
+        help_text = (
+            "📖 **Available Commands:**\n\n"
+            "**Basic:**\n"
+            "• /start - Welcome message\n"
+            "• /help - This message\n"
+            "• /info - Bot statistics\n\n"
+            "**Quiz Creation:**\n"
+            "• Send PDF/images - Process files\n"
+            "• /cancel - Cancel current task\n"
+            "• /queue - Check queue status\n\n"
+            "**Quiz Management:**\n"
+            "• /settings - Manage destinations\n"
+            "• /collectpolls - Collect polls\n"
+            "• /livequiz - Live quiz mode\n\n"
+            "**Admin Only:**\n"
+            "• /authorize - Add user\n"
+            "• /revoke - Remove user\n"
+            "• /users - List users\n\n"
+            "**💡 Need help?** Just send a file to start!"
+        )
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    @require_auth
+    async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Settings command"""
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Channel", callback_data="settings_add_channel")],
+            [InlineKeyboardButton("➕ Add Group", callback_data="settings_add_group")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="settings_manage_channels")],
+            [InlineKeyboardButton("👥 Manage Groups", callback_data="settings_manage_groups")]
+        ]
+        
         await update.message.reply_text(
-            f"📚 *Quick Help*\n\n"
-            f"Send PDF/Images for AI processing\n"
-            f"`/collectpolls` - Collect polls\n"
-            f"`/livequiz` - Start live quiz\n"
-            f"`/settings` - Configure\n\n"
-            f"Use `/start` for detailed help!",
+            "⚙️ **Settings**\n\nManage your posting destinations:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
     
     @require_auth
     async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Chat info"""
-        chat = update.effective_chat
-        t = f"📊 *Chat Info*\n\n"
-        t += f"🆔 ID: `{chat.id}`\n"
-        t += f"📛 {chat.title or 'Direct Message'}\n"
-        t += f"📝 Type: {chat.type}\n"
+        """Info command"""
+        user_id = update.effective_user.id
         
-        if update.message.message_thread_id:
-            t += f"🧵 Topic ID: `{update.message.message_thread_id}`\n"
+        # Get user stats
+        channels = db.get_user_channels(user_id)
+        groups = db.get_user_groups(user_id)
+        settings = db.get_user_settings(user_id)
         
-        await update.message.reply_text(t, parse_mode='Markdown')
+        # Queue status
+        queue_pos = task_queue.get_queue_position(user_id)
+        is_processing = task_queue.is_processing(user_id)
+        
+        info_text = (
+            f"ℹ️ **Bot Information**\n\n"
+            f"**Your Stats:**\n"
+            f"• Channels: {len(channels)}\n"
+            f"• Groups: {len(groups)}\n"
+            f"• Quiz Marker: {settings['quiz_marker']}\n"
+            f"• Explanation Tag: {settings['explanation_tag']}\n\n"
+            f"**Queue Status:**\n"
+            f"• Position: {queue_pos if queue_pos else 'Not in queue'}\n"
+            f"• Processing: {'Yes ⚙️' if is_processing else 'No'}\n\n"
+            f"**Bot Version:** {config.BOT_VERSION}\n"
+            f"**Model:** {config.GEMINI_MODEL}"
+        )
+        
+        await update.message.reply_text(info_text, parse_mode='Markdown')
     
     @require_auth
-    async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """AI model info"""
+    async def queue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Queue status command"""
+        user_id = update.effective_user.id
+        
+        pos = task_queue.get_queue_position(user_id)
+        is_proc = task_queue.is_processing(user_id)
+        queue_len = task_queue.get_queue_length()
+        
+        if is_proc:
+            status = "⚙️ Your task is being processed"
+        elif pos:
+            status = f"📋 Position in queue: {pos}"
+        else:
+            status = "✅ No active tasks"
+        
         await update.message.reply_text(
-            f"🤖 *AI System*\n\n"
-            f"Model: `{config.GEMINI_MODEL}`\n"
-            f"Workers: {config.MAX_CONCURRENT_IMAGES}\n"
-            f"Queue: {task_queue.get_queue_size()}/{config.MAX_QUEUE_SIZE}\n\n"
-            f"✅ Bengali/Unicode supported",
+            f"**Queue Status**\n\n"
+            f"{status}\n"
+            f"Total in queue: {queue_len}",
             parse_mode='Markdown'
         )
     
-    # ==================== POLL COLLECTION ====================
+    @require_auth
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel tasks - STOPS POSTING TOO"""
+        user_id = update.effective_user.id
+        
+        # Cancel posting if active
+        from processors.quiz_poster import quiz_poster
+        posting_cancelled = quiz_poster.cancel_posting(user_id)
+        
+        # Force clear queue
+        task_queue.clear_user(user_id)
+        self.user_states.pop(user_id, None)
+        
+        if posting_cancelled:
+            await update.message.reply_text("🛑 Posting cancelled! Clearing tasks...")
+        else:
+            await update.message.reply_text("✅ All tasks cancelled and cleared!")
     
     @require_auth
     async def collectpolls_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start poll collection"""
-        await poll_collector.handle_start_command(update, context)
+        await poll_collector.start_collection(update, context)
     
     @require_auth
-    async def handle_poll(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle poll message"""
-        await poll_collector.handle_poll_message(update, context)
-    
-    # ==================== LIVE QUIZ ====================
+    async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show current model"""
+        await update.message.reply_text(
+            f"🤖 **Current Model:**\n`{config.GEMINI_MODEL}`",
+            parse_mode='Markdown'
+        )
     
     @require_auth
     async def livequiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start live quiz - must reply to CSV/JSON"""
-        if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        """Start live quiz from CSV/JSON"""
+        user_id = update.effective_user.id
+        
+        # Check if user has questions
+        if user_id not in self.user_states or 'questions' not in self.user_states[user_id]:
             await update.message.reply_text(
-                "❌ *Live Quiz*\n\n"
-                "Please reply to a CSV or JSON file\n\n"
-                "📋 *Usage:*\n"
-                "`/livequiz` - Default settings\n"
-                "`/livequiz -t 15` - 15s per question\n"
-                "`/livequiz -m \"Exam starts!\"` - Custom message\n"
-                "`/livequiz -c -123456` - Post to chat ID",
-                parse_mode='Markdown'
+                "❌ No questions available!\n\n"
+                "Send a CSV or JSON file first."
             )
             return
         
-        # Parse arguments
-        args = self._parse_quiz_args(update.message.text)
-        time_per_q = args.get('t', config.DEFAULT_QUIZ_TIME)
-        target_chat = args.get('c', update.effective_chat.id)
-        custom_msg = args.get('m', None)
+        questions = self.user_states[user_id]['questions']
         
-        # Validate file
-        doc = update.message.reply_to_message.document
-        ext = doc.file_name.lower().rsplit('.', 1)[-1]
+        # Parse arguments for time and message
+        args = context.args
+        time_per_q = 10  # Default
+        custom_msg = None
         
-        if ext not in ('csv', 'json'):
-            await update.message.reply_text("❌ File must be CSV or JSON")
-            return
-        
-        # Download and load
-        msg = await update.message.reply_text("📥 *Loading quiz...*", parse_mode='Markdown')
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
-            file = await context.bot.get_file(doc.file_id)
-            await file.download_to_drive(tmp.name)
-            
-            # Load questions
-            if ext == 'csv':
-                questions = await self._load_quiz_from_csv(tmp.name)
+        # Parse flags: -t 15 -m "message"
+        i = 0
+        while i < len(args):
+            if args[i] == '-t' and i + 1 < len(args):
+                try:
+                    time_per_q = int(args[i + 1])
+                    i += 2
+                except:
+                    i += 1
+            elif args[i] == '-m' and i + 1 < len(args):
+                custom_msg = ' '.join(args[i + 1:])
+                break
             else:
-                questions = await self._load_quiz_from_json(tmp.name)
+                i += 1
         
-        import os
-        os.unlink(tmp.name)
-        
-        if not questions:
-            await msg.edit_text("❌ *No valid questions found*", parse_mode='Markdown')
-            return
-        
-        # Create session
-        session_id = live_quiz_manager.create_session(
-            target_chat, questions, time_per_q, custom_msg
-        )
-        
-        await msg.edit_text(
-            f"✅ *Live Quiz Started!*\n\n"
-            f"📊 Questions: {len(questions)}\n"
-            f"⏱️ Time: {time_per_q}s each\n"
-            f"🎯 Chat ID: `{target_chat}`\n\n"
-            f"Quiz running...",
-            parse_mode='Markdown'
-        )
-        
-        # Run quiz
-        import asyncio
-        asyncio.create_task(live_quiz_manager.run_quiz(session_id, context))
-    
-    def _parse_quiz_args(self, text: str) -> dict:
-        """Parse quiz command arguments"""
-        args = {}
-        
-        # -m "message"
-        m_match = re.search(r'-m\s+"([^"]+)"', text)
-        if m_match:
-            args['m'] = m_match.group(1)
-        
-        # -c chat_id
-        c_match = re.search(r'-c\s+(-?\d+)', text)
-        if c_match:
-            args['c'] = int(c_match.group(1))
-        
-        # -t time
-        t_match = re.search(r'-t\s+(\d+)', text)
-        if t_match:
-            args['t'] = int(t_match.group(1))
-        
-        return args
-    
-    async def _load_quiz_from_csv(self, path: str) -> list:
-        """Load quiz from CSV"""
-        import csv
-        questions = []
-        
-        try:
-            with open(path, 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                
-                for row in reader:
-                    q_text = row.get('questions', '').strip()
-                    if not q_text:
-                        continue
-                    
-                    options = []
-                    for i in range(1, 6):
-                        opt = row.get(f'option{i}', '').strip()
-                        if opt:
-                            options.append(opt)
-                    
-                    if len(options) < 2:
-                        continue
-                    
-                    try:
-                        answer_idx = int(row.get('answer', '1')) - 1
-                        if answer_idx < 0 or answer_idx >= len(options):
-                            answer_idx = 0
-                    except:
-                        answer_idx = 0
-                    
-                    questions.append({
-                        'question_description': q_text,
-                        'options': options,
-                        'correct_option': chr(65 + answer_idx),
-                        'explanation': row.get('explanation', '').strip()
-                    })
-        except Exception as e:
-            print(f"❌ CSV load error: {e}")
-        
-        return questions
-    
-    async def _load_quiz_from_json(self, path: str) -> list:
-        """Load quiz from JSON"""
-        questions = []
-        
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        # Store for custom message prompt
+        from bot.callbacks import CallbackHandlers
+        if hasattr(context.bot_data, 'callback_handlers'):
+            callback_handlers = context.bot_data['callback_handlers']
             
-            if not isinstance(data, list):
-                return questions
+            session_id = f"live_{user_id}"
+            callback_handlers.custom_message_sessions[user_id] = {
+                'session_id': session_id,
+                'waiting_for': 'custom_message',
+                'questions': questions,
+                'quiz_type': 'live'
+            }
             
-            for item in data:
-                q_text = item.get('question', '').strip()
-                opts_dict = item.get('options', {})
-                
-                if not q_text or not opts_dict:
-                    continue
-                
-                options = []
-                for letter in ['A', 'B', 'C', 'D', 'E']:
-                    opt = opts_dict.get(letter)
-                    if opt:
-                        options.append(opt)
-                
-                if len(options) < 2:
-                    continue
-                
-                correct = item.get('correct_answer', 'A').upper()
-                
-                questions.append({
-                    'question_description': q_text,
-                    'options': options,
-                    'correct_option': correct,
-                    'explanation': item.get('explanation', '').strip()
-                })
-        except Exception as e:
-            print(f"❌ JSON load error: {e}")
-        
-        return questions
-    
-    # ==================== ADMIN COMMANDS ====================
-    
-    @require_sudo
-    async def authorize_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Authorize user"""
-        if not context.args:
-            await update.message.reply_text("Usage: `/authorize <user_id>`", parse_mode='Markdown')
-            return
-        try:
-            db.authorize_user(int(context.args[0]), update.effective_user.id)
-            await update.message.reply_text(f"✅ User `{context.args[0]}` authorized!", parse_mode='Markdown')
-        except:
-            await update.message.reply_text("❌ Invalid user ID.")
-    
-    @require_sudo
-    async def revoke_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Revoke user"""
-        if not context.args:
-            await update.message.reply_text("Usage: `/revoke <user_id>`", parse_mode='Markdown')
-            return
-        try:
-            uid = int(context.args[0])
-            if db.is_sudo(uid):
-                await update.message.reply_text("❌ Cannot revoke sudo!")
-                return
-            db.revoke_user(uid)
-            await update.message.reply_text(f"✅ Revoked!")
-        except:
-            await update.message.reply_text("❌ Invalid user ID.")
-    
-    @require_sudo
-    async def users_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """List users"""
-        users = db.get_authorized_users()
-        if not users:
-            await update.message.reply_text("No users.")
-            return
-        t = f"👥 *Authorized ({len(users)}):*\n\n"
-        for u in users:
-            t += f"{'🔐' if u.get('is_sudo') else '👤'} `{u['user_id']}`\n"
-        await update.message.reply_text(t, parse_mode='Markdown')
-    
-    # ==================== SETTINGS ====================
-    
-    @require_auth
-    async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Settings menu"""
-        user_id = update.effective_user.id
-        settings = db.get_user_settings(user_id)
-        channels = db.get_user_channels(user_id)
-        groups = db.get_user_groups(user_id)
-        
-        keyboard = [
-            [InlineKeyboardButton("➕ Channel", callback_data="settings_add_channel"),
-             InlineKeyboardButton("➕ Group", callback_data="settings_add_group")],
-            [InlineKeyboardButton("📺 Channels", callback_data="settings_manage_channels"),
-             InlineKeyboardButton("👥 Groups", callback_data="settings_manage_groups")],
-        ]
-        
-        await update.message.reply_text(
-            f"⚙️ *Settings*\n\n"
-            f"📢 Marker: `{settings['quiz_marker']}`\n"
-            f"🔗 Tag: `{settings['explanation_tag']}`\n\n"
-            f"📺 Channels: {len(channels)}\n"
-            f"👥 Groups: {len(groups)}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-    
-    # ==================== QUEUE MANAGEMENT ====================
-    
-    @require_auth
-    async def queue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check queue status - GHOST BUG FIXED"""
-        user_id = update.effective_user.id
-        
-        # Force timeout check
-        task_queue._check_timeout(user_id)
-        
-        # Check if actually processing (with timeout check)
-        if task_queue.is_processing(user_id):
-            await update.message.reply_text("⚙️ Your task is being processed...")
-        else:
-            pos = task_queue.get_position(user_id)
-            if pos > 0:
-                await update.message.reply_text(f"📋 Queue position: {pos}")
-            else:
-                await update.message.reply_text("✅ No tasks in queue or processing.")
-    
-    @require_auth
-    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel tasks - GHOST BUG FIXED"""
-        user_id = update.effective_user.id
-        
-        # Force clear everything
-        task_queue.clear_user(user_id)
-        self.user_states.pop(user_id, None)
-        
-        await update.message.reply_text("✅ All tasks cancelled and cleared!")
+            keyboard = [[InlineKeyboardButton("⏭️ Skip Message", callback_data=f"livequiz_skip_{session_id}")]]
+            
+            await update.message.reply_text(
+                "🎯 **Live Quiz Setup**\n\n"
+                "📝 Send a custom announcement message\n"
+                "or skip to start immediately.\n\n"
+                "💡 Example: \"Final Exam Starting Now!\"",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
     
     # ==================== FILE HANDLERS ====================
     
     @require_auth
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle document upload - GHOST BUG PREVENTION"""
+        """Handle PDF/document uploads"""
         user_id = update.effective_user.id
         doc = update.message.document
         
-        if doc.file_name.endswith('.csv'):
-            await self.handle_csv(update, context)
-            return
-        
-        if not doc.file_name.endswith('.pdf'):
-            await update.message.reply_text("❌ Send PDF or CSV only.")
-            return
-        
-        # ===== GHOST BUG PREVENTION - Force timeout check =====
+        # Ghost bug prevention - check timeout first
         task_queue._check_timeout(user_id)
         
-        # Double check if actually processing
-        if user_id in self.user_states or task_queue.is_processing(user_id):
+        # Check if already in queue
+        if task_queue.is_in_queue(user_id) or task_queue.is_processing(user_id):
             await update.message.reply_text(
-                "⚠️ *Task in progress*\n\n"
-                "If stuck, use `/cancel` to force clear.",
-                parse_mode='Markdown'
+                "⚠️ You already have a task running!\n"
+                "Use /cancel to stop it first."
             )
             return
         
-        msg = await update.message.reply_text("📥 Downloading PDF...")
-        try:
+        # Check file type
+        if doc.mime_type == 'application/pdf':
+            # Download PDF
             file = await context.bot.get_file(doc.file_id)
-            path = config.TEMP_DIR / f"{user_id}_{doc.file_name}"
-            await file.download_to_drive(path)
+            pdf_path = config.TEMP_DIR / f"{user_id}_{doc.file_name}"
+            await file.download_to_drive(pdf_path)
             
+            # Store state
+            self.user_states[user_id] = {
+                'content_type': 'pdf',
+                'content_paths': [pdf_path],
+                'waiting_for': None
+            }
+            
+            # Ask for page range
             keyboard = [
                 [InlineKeyboardButton("📄 All Pages", callback_data="pages_all")],
-                [InlineKeyboardButton("🔢 Select Range", callback_data="pages_custom")]
+                [InlineKeyboardButton("🔢 Custom Range", callback_data="pages_custom")]
             ]
-            self.user_states[user_id] = {'content_type': 'pdf', 'content_paths': [path]}
-            await msg.edit_text(
-                "📄 *PDF Received!*\n\nSelect pages:",
+            
+            await update.message.reply_text(
+                "📄 **PDF Received**\n\nSelect pages to process:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
-        except Exception as e:
-            await msg.edit_text(f"❌ Error: {e}")
+        else:
+            await update.message.reply_text("❌ Please send a PDF file.")
     
     @require_auth
     async def handle_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle CSV upload - GHOST BUG PREVENTION"""
+        """Handle CSV file uploads"""
         user_id = update.effective_user.id
+        doc = update.message.document
         
-        # ===== GHOST BUG PREVENTION =====
+        # Ghost bug prevention
         task_queue._check_timeout(user_id)
         
-        if user_id in self.user_states or task_queue.is_processing(user_id):
-            await update.message.reply_text(
-                "⚠️ *Task in progress*\n\n"
-                "If stuck, use `/cancel` to force clear.",
-                parse_mode='Markdown'
-            )
+        if not doc.file_name.endswith('.csv'):
+            await update.message.reply_text("❌ Please send a CSV file.")
             return
         
-        msg = await update.message.reply_text("📊 Processing CSV...")
         try:
-            file = await context.bot.get_file(update.message.document.file_id)
-            content = await file.download_as_bytearray()
-            questions = CSVParser.parse_csv_file(bytes(content))
+            # Download CSV
+            file = await context.bot.get_file(doc.file_id)
+            csv_path = config.TEMP_DIR / f"{user_id}_{doc.file_name}"
+            await file.download_to_drive(csv_path)
+            
+            # Parse CSV
+            questions = await self._load_quiz_from_csv(csv_path)
+            csv_path.unlink(missing_ok=True)
             
             if not questions:
-                await msg.edit_text("❌ No valid questions found in CSV.")
+                await update.message.reply_text("❌ No valid questions found in CSV!")
                 return
             
-            session_id = f"csv_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            # Store questions
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_id = f"csv_{user_id}_{timestamp}"
+            
             self.user_states[user_id] = {
                 'questions': questions,
                 'session_id': session_id,
                 'source': 'csv'
             }
             
+            # Show options
             keyboard = [
                 [InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")],
-                [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")],
-                [InlineKeyboardButton("📄 Export PDF", callback_data=f"export_pdf_{session_id}")]
+                [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")]
             ]
-            await msg.edit_text(
-                f"✅ *CSV Processed!*\n\n"
+            
+            await update.message.reply_text(
+                f"✅ **CSV Loaded**\n\n"
                 f"📊 Questions: {len(questions)}\n\n"
                 f"Choose action:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
+            
         except Exception as e:
-            await msg.edit_text(f"❌ Error processing CSV: {str(e)[:200]}")
+            print(f"❌ CSV parsing error: {e}")
+            await update.message.reply_text(
+                f"❌ **CSV Parse Error**\n\n"
+                f"Gemini returned invalid JSON.\n\n"
+                f"Error: `{str(e)[:100]}`",
+                parse_mode='Markdown'
+            )
     
     @require_auth
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle photo upload - GHOST BUG PREVENTION"""
+        """Handle image uploads"""
         user_id = update.effective_user.id
         
-        # ===== GHOST BUG PREVENTION =====
+        # Ghost bug prevention
         task_queue._check_timeout(user_id)
         
-        if user_id in self.user_states or task_queue.is_processing(user_id):
-            await update.message.reply_text(
-                "⚠️ *Task in progress*\n\n"
-                "If stuck, use `/cancel` to force clear.",
-                parse_mode='Markdown'
-            )
-            return
+        # Get highest resolution photo
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
         
-        msg = await update.message.reply_text("📥 Downloading image...")
-        try:
-            photo = update.message.photo[-1]
-            file = await context.bot.get_file(photo.file_id)
-            path = config.TEMP_DIR / f"{user_id}_image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            await file.download_to_drive(path)
-            
-            keyboard = [
-                [InlineKeyboardButton("📤 Extraction", callback_data="mode_extraction")],
-                [InlineKeyboardButton("✨ Generation", callback_data="mode_generation")]
-            ]
+        img_path = config.TEMP_DIR / f"{user_id}_{photo.file_id}.jpg"
+        await file.download_to_drive(img_path)
+        
+        # Add to or create state
+        if user_id not in self.user_states or self.user_states[user_id].get('content_type') != 'images':
             self.user_states[user_id] = {
                 'content_type': 'images',
-                'content_paths': [path]
+                'content_paths': [],
+                'waiting_for': None
             }
-            await msg.edit_text(
-                "🖼️ *Image Received!*\n\nChoose mode:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            await msg.edit_text(f"❌ Error: {e}")
+        
+        self.user_states[user_id]['content_paths'].append(img_path)
+        
+        count = len(self.user_states[user_id]['content_paths'])
+        
+        # Ask for mode
+        keyboard = [
+            [InlineKeyboardButton("📤 Extraction", callback_data="mode_extraction")],
+            [InlineKeyboardButton("✨ Generation", callback_data="mode_generation")]
+        ]
+        
+        await update.message.reply_text(
+            f"📸 **Image {count} received**\n\n"
+            f"Send more images or choose mode:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    
+    # ==================== HELPER METHODS ====================
     
     async def add_to_queue_direct(self, user_id, page_range, context):
-        """Add to processing queue"""
+        """Add task to queue"""
         if user_id not in self.user_states:
             return
         
-        mode = self.user_states[user_id].get('mode', 'extraction')
-        task_data = {
-            'content_type': self.user_states[user_id]['content_type'],
-            'content_paths': self.user_states[user_id]['content_paths'],
-            'page_range': page_range,
-            'mode': mode,
-            'context': context
-        }
+        state = self.user_states[user_id]
+        state['page_range'] = page_range
         
-        pos = task_queue.add_task(user_id, task_data)
+        # Add to queue
+        task_queue.add_task(user_id, state, context)
         
-        if pos == -1:
-            msg = "❌ Queue full. Please try again later."
-        elif pos == -2:
-            msg = "⚠️ You already have a task queued or processing.\nUse `/cancel` to clear."
+        pos = task_queue.get_queue_position(user_id)
+        
+        if pos == 1:
+            await context.bot.send_message(
+                user_id,
+                "⚙️ **Processing started...**",
+                parse_mode='Markdown'
+            )
         else:
-            msg = f"✅ Added to queue!\n📋 Position: {pos}"
+            await context.bot.send_message(
+                user_id,
+                f"✅ **Added to queue!**\n📋 Position: {pos}",
+                parse_mode='Markdown'
+            )
+    
+    async def _load_quiz_from_csv(self, csv_path: Path) -> list:
+        """Load quiz from CSV file"""
+        questions = []
         
-        await context.bot.send_message(user_id, msg, parse_mode='Markdown')
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Parse options
+                options = []
+                for i in range(1, 11):  # Support up to 10 options
+                    opt = row.get(f'option{i}', '').strip()
+                    if opt:
+                        options.append(opt)
+                
+                if len(options) < 2:
+                    continue
+                
+                # Parse answer (1-based to 0-based index)
+                try:
+                    answer_idx = int(row.get('answer', '1')) - 1
+                    answer_idx = max(0, min(answer_idx, len(options) - 1))
+                except:
+                    answer_idx = 0
+                
+                questions.append({
+                    'question_description': row.get('questions', '').strip(),
+                    'options': options,
+                    'correct_answer_index': answer_idx,
+                    'correct_option': chr(65 + answer_idx),  # A, B, C...
+                    'explanation': row.get('explanation', '').strip()
+                })
+        
+        return questions
+    
+    async def _load_quiz_from_json(self, json_path: Path) -> list:
+        """Load quiz from JSON file"""
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        questions = []
+        for q in data:
+            # Get options as list
+            opts_dict = q.get('options', {})
+            options = []
+            for letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']:
+                opt = opts_dict.get(letter)
+                if opt:
+                    options.append(opt)
+            
+            if len(options) < 2:
+                continue
+            
+            # Get correct answer
+            correct_letter = q.get('correct_answer', 'A').upper()
+            correct_idx = ord(correct_letter) - ord('A')
+            correct_idx = max(0, min(correct_idx, len(options) - 1))
+            
+            questions.append({
+                'question_description': q.get('question', '').strip(),
+                'options': options,
+                'correct_answer_index': correct_idx,
+                'correct_option': chr(65 + correct_idx),
+                'explanation': q.get('explanation', '').strip()
+            })
+        
+        return questions
+    
+    # ==================== ADMIN COMMANDS ====================
+    
+    async def authorize_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Authorize user (sudo only)"""
+        if update.effective_user.id not in config.SUDO_USER_IDS:
+            return
+        
+        if not context.args:
+            await update.message.reply_text("Usage: /authorize <user_id>")
+            return
+        
+        try:
+            target_id = int(context.args[0])
+            db.authorize_user(target_id)
+            await update.message.reply_text(f"✅ User {target_id} authorized!")
+        except:
+            await update.message.reply_text("❌ Invalid user ID")
+    
+    async def revoke_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Revoke user (sudo only)"""
+        if update.effective_user.id not in config.SUDO_USER_IDS:
+            return
+        
+        if not context.args:
+            await update.message.reply_text("Usage: /revoke <user_id>")
+            return
+        
+        try:
+            target_id = int(context.args[0])
+            db.revoke_user(target_id)
+            await update.message.reply_text(f"✅ User {target_id} revoked!")
+        except:
+            await update.message.reply_text("❌ Invalid user ID")
+    
+    async def users_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List authorized users (sudo only)"""
+        if update.effective_user.id not in config.SUDO_USER_IDS:
+            return
+        
+        users = db.get_authorized_users()
+        if not users:
+            await update.message.reply_text("No authorized users.")
+            return
+        
+        user_list = "\n".join([f"• {u['user_id']}" for u in users])
+        await update.message.reply_text(f"**Authorized Users:**\n\n{user_list}", parse_mode='Markdown')
