@@ -2,8 +2,9 @@
 Content Processor - COMPLETE & FIXED
 - Auto-generates 3 files
 - Single edited message (no spam)
-- Correct question format
+- Robust question format handling
 - Error reporting
+- Custom message pinning
 """
 
 import json
@@ -84,14 +85,15 @@ class ContentProcessor:
             # Get processor
             processor = self.bot_handlers.get_processor(user_id)
             
-            # Process images - WITH ERROR REPORTING
+            # Process images - WITH ERROR REPORTING & SINGLE MESSAGE
             try:
                 raw_questions = await processor.process_images_parallel(
                     images, 
                     mode, 
                     progress,
                     user_id=user_id,
-                    context=context
+                    context=context,
+                    progress_msg=msg  # ← PASS MESSAGE TO EDIT
                 )
             except Exception as e:
                 await msg.edit_text(
@@ -117,7 +119,29 @@ class ContentProcessor:
                 return
 
             # ===== FIX QUESTION FORMAT FOR POSTING =====
-            questions = self._normalize_questions(raw_questions)
+            try:
+                questions = self._normalize_questions(raw_questions)
+                
+                if not questions:
+                    await msg.edit_text(
+                        "❌ *No Valid Questions*\n\n"
+                        "Questions were found but couldn't be parsed.\n"
+                        "This might be a format issue.",
+                        parse_mode='Markdown'
+                    )
+                    return
+            except Exception as e:
+                print(f"❌ Normalization error: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                await msg.edit_text(
+                    f"❌ *Question Format Error*\n\n"
+                    f"Error: `{str(e)[:200]}`\n\n"
+                    f"The questions couldn't be converted to the right format.",
+                    parse_mode='Markdown'
+                )
+                return
 
             # Store in session
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -161,11 +185,21 @@ class ContentProcessor:
         """
         Normalize questions to format expected by quiz_poster
         
-        Input format (from Gemini):
+        Handles MULTIPLE input formats:
+        
+        Format 1 (from Gemini with dict options):
         {
             'question': str,
             'options': {'A': str, 'B': str, ...},
             'correct_answer': 'A',
+            'explanation': str
+        }
+        
+        Format 2 (from Gemini with list options):
+        {
+            'question_description': str,
+            'options': [str, str, ...],
+            'correct_answer_index': int,
             'explanation': str
         }
         
@@ -180,29 +214,118 @@ class ContentProcessor:
         """
         normalized = []
         
-        for q in raw_questions:
-            # Get options as list
-            opts_dict = q.get('options', {})
-            options = []
-            for letter in ['A', 'B', 'C', 'D', 'E']:
-                opt = opts_dict.get(letter)
-                if opt:
-                    options.append(opt)
+        for idx, q in enumerate(raw_questions):
+            # Skip if not a dict
+            if not isinstance(q, dict):
+                print(f"⚠️ Question {idx+1} is not a dict, skipping: {type(q)}")
+                continue
             
-            # Get correct answer index
-            correct_letter = q.get('correct_answer', 'A').upper()
-            correct_idx = ord(correct_letter) - ord('A')
+            # ===== DETECT FORMAT AND NORMALIZE =====
             
-            # Ensure index is valid
-            if correct_idx < 0 or correct_idx >= len(options):
-                correct_idx = 0
-                correct_letter = 'A'
+            # Check if already in target format (has 'question_description' and list 'options')
+            if 'question_description' in q and isinstance(q.get('options'), list):
+                # Already normalized - just ensure all fields exist
+                normalized.append({
+                    'question_description': q.get('question_description', ''),
+                    'options': q.get('options', []),
+                    'correct_answer_index': q.get('correct_answer_index', 0),
+                    'correct_option': q.get('correct_option', 'A'),
+                    'explanation': q.get('explanation', '')
+                })
+                continue
+            
+            # Format 1: Has 'question' and dict 'options'
+            if 'question' in q and isinstance(q.get('options'), dict):
+                question_text = q.get('question', '')
+                opts_dict = q.get('options', {})
+                
+                # Convert dict to list
+                options = []
+                for letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']:
+                    opt = opts_dict.get(letter)
+                    if opt:
+                        options.append(opt)
+                
+                if len(options) < 2:
+                    print(f"⚠️ Question {idx+1} has <2 options, skipping")
+                    continue
+                
+                # Get correct answer
+                correct_letter = q.get('correct_answer', 'A').upper()
+                correct_idx = ord(correct_letter) - ord('A')
+                
+                # Ensure index is valid
+                if correct_idx < 0 or correct_idx >= len(options):
+                    correct_idx = 0
+                    correct_letter = 'A'
+                
+                normalized.append({
+                    'question_description': question_text,
+                    'options': options,
+                    'correct_answer_index': correct_idx,
+                    'correct_option': correct_letter,
+                    'explanation': q.get('explanation', '')
+                })
+                continue
+            
+            # Format 2: Has 'question' and list 'options'
+            if 'question' in q and isinstance(q.get('options'), list):
+                question_text = q.get('question', '')
+                options = q.get('options', [])
+                
+                if len(options) < 2:
+                    print(f"⚠️ Question {idx+1} has <2 options, skipping")
+                    continue
+                
+                # Get correct answer
+                if 'correct_answer_index' in q:
+                    correct_idx = q.get('correct_answer_index', 0)
+                elif 'correct_answer' in q:
+                    correct_letter = q.get('correct_answer', 'A').upper()
+                    correct_idx = ord(correct_letter) - ord('A')
+                else:
+                    correct_idx = 0
+                
+                # Ensure index is valid
+                if correct_idx < 0 or correct_idx >= len(options):
+                    correct_idx = 0
+                
+                correct_letter = chr(65 + correct_idx)
+                
+                normalized.append({
+                    'question_description': question_text,
+                    'options': options,
+                    'correct_answer_index': correct_idx,
+                    'correct_option': correct_letter,
+                    'explanation': q.get('explanation', '')
+                })
+                continue
+            
+            # Unknown format - try to extract what we can
+            print(f"⚠️ Question {idx+1} has unknown format: {q.keys()}")
+            
+            # Try to find question text
+            question_text = (
+                q.get('question_description') or 
+                q.get('question') or 
+                q.get('text') or 
+                ''
+            )
+            
+            # Try to find options
+            options = q.get('options', [])
+            if isinstance(options, dict):
+                options = [options.get(letter) for letter in ['A', 'B', 'C', 'D', 'E'] if options.get(letter)]
+            
+            if not question_text or len(options) < 2:
+                print(f"⚠️ Question {idx+1} invalid, skipping")
+                continue
             
             normalized.append({
-                'question_description': q.get('question', ''),
+                'question_description': question_text,
                 'options': options,
-                'correct_answer_index': correct_idx,
-                'correct_option': correct_letter,
+                'correct_answer_index': 0,
+                'correct_option': 'A',
                 'explanation': q.get('explanation', '')
             })
         
