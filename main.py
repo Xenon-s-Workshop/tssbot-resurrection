@@ -11,6 +11,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    PollAnswerHandler,
     filters,
     ContextTypes
 )
@@ -110,10 +111,7 @@ class BotApplication:
         app.add_handler(CallbackQueryHandler(self.callback_handlers.handle_callback))
         
         # ==================== POLL ANSWER HANDLER ====================
-        app.add_handler(MessageHandler(
-            filters.UpdateType.POLL_ANSWER,
-            live_quiz_manager.handle_poll_answer
-        ))
+        app.add_handler(PollAnswerHandler(live_quiz_manager.handle_poll_answer))
         
         print("✅ All handlers registered")
     
@@ -190,11 +188,20 @@ class BotApplication:
         print(f"🚀 Starting {config.BOT_NAME}")
         print("=" * 60)
         
-        # Start queue processor as background task
-        asyncio.create_task(self.process_queue())
-        
         # Run post_init
         self.application.post_init = self.post_init
+        
+        # Start queue processor in the event loop
+        async def startup():
+            """Startup tasks"""
+            # Create background task for queue processing
+            asyncio.create_task(self.process_queue())
+        
+        # Add startup task
+        self.application.post_init = lambda app: asyncio.gather(
+            self.post_init(app),
+            startup()
+        )
         
         # Start polling
         print("🎯 Bot is running! Press Ctrl+C to stop.")
