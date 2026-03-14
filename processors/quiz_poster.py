@@ -12,6 +12,7 @@ from config import config
 class QuizPoster:
     def __init__(self):
         self.active_postings = {}  # {user_id: {'cancel': bool}}
+        print("✅ Quiz Poster initialized")
     
     @staticmethod
     def format_question(text: str, marker: str) -> str:
@@ -164,5 +165,6 @@ class QuizPoster:
             return True
         return False
 
-# Global instance
+
+# ===== GLOBAL INSTANCE - MUST BE AT END OF FILE =====
 quiz_poster = QuizPoster()
