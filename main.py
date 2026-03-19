@@ -1,10 +1,6 @@
 """
-Telegram Quiz Bot — Main entry point.
-Fixes applied:
-- Global error handler logs + notifies user
-- Poll answer handler for /collectpolls
-- show_dest_ callback routed through content_processor
-- Queue processor with proper lifecycle
+TSS Telegram Bot - Main Entry Point
+Complete quiz bot with proper error handling and UX
 """
 
 import asyncio
@@ -17,140 +13,210 @@ from telegram.ext import (
     CallbackQueryHandler,
     PollAnswerHandler,
     filters,
+    ContextTypes
 )
+
 from config import config
 from database import db
-from utils.api_rotator import GeminiAPIRotator
-from utils.queue_manager import task_queue
-from processors.pdf_processor import PDFProcessor
 from bot.handlers import BotHandlers
 from bot.callbacks import CallbackHandlers
-from bot.content_processor import ContentProcessor
+from processors.poll_collector import poll_collector
+from processors.live_quiz import live_quiz_manager
+from utils.queue_manager import task_queue
+from processors.pdf_processor import PDFProcessor
+from utils.api_rotator import GeminiAPIRotator
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-
+# Enhanced logging
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-
-# ── Shared instances ──────────────────────────────────────────────────────────
-
-api_rotator = GeminiAPIRotator(config.GEMINI_API_KEYS)
-pdf_processor_instance = PDFProcessor(api_rotator)
-
-
-# ── Queue processor ───────────────────────────────────────────────────────────
-
-class QueueProcessor:
-    def __init__(self, bot_handlers: BotHandlers):
-        self.bot_handlers = bot_handlers
-        self.content_processor = ContentProcessor(bot_handlers)
-        self.running = False
-
-    async def start(self):
-        if self.running:
-            return
-        self.running = True
-        logger.info("🔄 Queue processor started")
-
-        while self.running:
+class BotApplication:
+    def __init__(self):
+        print("🔧 Initializing bot...")
+        
+        self.api_rotator = GeminiAPIRotator(config.GEMINI_API_KEYS)
+        self.pdf_processor = PDFProcessor(self.api_rotator)
+        self.bot_handlers = BotHandlers()
+        self.callback_handlers = CallbackHandlers(self.bot_handlers)
+        self.application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+        
+        # Register global error handler
+        self.application.add_error_handler(self.error_handler)
+        
+        self._register_handlers()
+        
+        print("✅ Bot initialized successfully")
+    
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler"""
+        logger.error(f"Exception while handling update: {context.error}", exc_info=context.error)
+        
+        # Try to inform user
+        try:
+            if update and hasattr(update, 'effective_user') and update.effective_user:
+                user_id = update.effective_user.id
+                error_msg = str(context.error)
+                
+                # Shorten error message
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                
+                await context.bot.send_message(
+                    user_id,
+                    f"❌ **Error**\n\n`{error_msg}`\n\nPlease try again or contact admin.",
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            logger.error(f"Failed to send error message: {e}")
+    
+    def _register_handlers(self):
+        """Register all handlers"""
+        app = self.application
+        
+        # Commands
+        app.add_handler(CommandHandler("start", self.bot_handlers.start_command))
+        app.add_handler(CommandHandler("help", self.bot_handlers.help_command))
+        app.add_handler(CommandHandler("settings", self.bot_handlers.settings_command))
+        app.add_handler(CommandHandler("info", self.bot_handlers.info_command))
+        app.add_handler(CommandHandler("queue", self.bot_handlers.queue_command))
+        app.add_handler(CommandHandler("cancel", self.bot_handlers.cancel_command))
+        app.add_handler(CommandHandler("collectpolls", self.bot_handlers.collectpolls_command))
+        app.add_handler(CommandHandler("model", self.bot_handlers.model_command))
+        app.add_handler(CommandHandler("livequiz", self.bot_handlers.livequiz_command))
+        
+        # Admin
+        app.add_handler(CommandHandler("authorize", self.bot_handlers.authorize_command))
+        app.add_handler(CommandHandler("revoke", self.bot_handlers.revoke_command))
+        app.add_handler(CommandHandler("users", self.bot_handlers.users_command))
+        
+        # Files
+        app.add_handler(MessageHandler(
+            filters.Document.PDF | filters.Document.FileExtension("pdf"),
+            self.bot_handlers.handle_document
+        ))
+        
+        app.add_handler(MessageHandler(
+            filters.Document.FileExtension("csv"),
+            self.bot_handlers.handle_csv
+        ))
+        
+        app.add_handler(MessageHandler(
+            filters.Document.FileExtension("json"),
+            self.bot_handlers.handle_json
+        ))
+        
+        app.add_handler(MessageHandler(
+            filters.PHOTO,
+            self.bot_handlers.handle_photo
+        ))
+        
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self.callback_handlers.handle_text
+        ))
+        
+        # Callbacks
+        app.add_handler(CallbackQueryHandler(self.callback_handlers.handle_callback))
+        
+        # Poll answers
+        app.add_handler(PollAnswerHandler(live_quiz_manager.handle_poll_answer))
+        
+        print("✅ Handlers registered")
+    
+    async def post_init(self, application: Application):
+        """Post initialization"""
+        poll_collector.set_application(application)
+        application.bot_data['callback_handlers'] = self.callback_handlers
+        print("✅ Post-init complete")
+    
+    async def process_queue(self):
+        """Process task queue"""
+        from bot.content_processor import ContentProcessor
+        
+        while True:
             try:
                 task = task_queue.get_next_task()
+                
                 if task:
-                    user_id = task["user_id"]
-                    task_data = task["data"]
-                    task_queue.set_processing(user_id, True)
+                    user_id = task['user_id']
+                    state = task['state']
+                    context = task['context']
+                    
+                    print(f"⚙️ Processing task for user {user_id}")
+                    
                     try:
-                        await self.content_processor.process_content(
-                            user_id=user_id,
-                            content_type=task_data["content_type"],
-                            content_paths=task_data["content_paths"],
-                            page_range=task_data.get("page_range"),
-                            mode=task_data["mode"],
-                            context=task_data["context"],
+                        task_queue.set_processing(user_id, True)
+                        
+                        processor = ContentProcessor(self.bot_handlers)
+                        await processor.process_content(
+                            user_id,
+                            state['content_type'],
+                            state['content_paths'],
+                            state.get('page_range'),
+                            state['mode'],
+                            context
                         )
+                        
                     except Exception as e:
-                        logger.error(f"Queue task error for user {user_id}: {e}", exc_info=True)
+                        logger.error(f"Task processing error for user {user_id}: {e}", exc_info=True)
+                        
+                        try:
+                            await context.bot.send_message(
+                                user_id,
+                                f"❌ **Processing Failed**\n\n`{str(e)[:200]}`",
+                                parse_mode='Markdown'
+                            )
+                        except:
+                            pass
+                    
                     finally:
                         task_queue.set_processing(user_id, False)
-                    await asyncio.sleep(0.5)
-                else:
-                    await asyncio.sleep(1)
+                
+                await asyncio.sleep(1)
+            
             except Exception as e:
-                logger.error(f"Queue loop error: {e}", exc_info=True)
-                await asyncio.sleep(3)
-
-
-# ── Global error handler ──────────────────────────────────────────────────────
-
-async def global_error_handler(update: object, context):
-    logger.error("Unhandled exception:", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "⚠️ An unexpected error occurred. The team has been notified.\n"
-                "Please try again or use /cancel to reset your session."
-            )
-        except Exception:
-            pass
-
-
-# ── Post-init hook ────────────────────────────────────────────────────────────
-
-async def post_init(application: Application):
-    bot_handlers = application.bot_data["handlers"]
-    queue_processor = QueueProcessor(bot_handlers)
-    asyncio.create_task(queue_processor.start())
-    logger.info("✅ Queue processor initialised")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+                logger.error(f"Queue processing error: {e}", exc_info=True)
+                await asyncio.sleep(5)
+    
+    def run(self):
+        """Run the bot"""
+        print("\n" + "=" * 60)
+        print(f"🚀 Starting {config.BOT_NAME} v{config.BOT_VERSION}")
+        print("=" * 60 + "\n")
+        
+        async def startup():
+            asyncio.create_task(self.process_queue())
+        
+        self.application.post_init = lambda app: asyncio.gather(
+            self.post_init(app),
+            startup()
+        )
+        
+        print("🎯 Bot is now running...")
+        self.application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
 
 def main():
-    bot_handlers = BotHandlers(pdf_processor_instance)
-    callback_handlers = CallbackHandlers(bot_handlers)
-
-    application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
-    application.bot_data["handlers"] = bot_handlers
-    application.post_init = post_init
-
-    # Commands
-    application.add_handler(CommandHandler("start", bot_handlers.start))
-    application.add_handler(CommandHandler("help", bot_handlers.help_command))
-    application.add_handler(CommandHandler("settings", bot_handlers.settings_command))
-    application.add_handler(CommandHandler("info", bot_handlers.info_command))
-    application.add_handler(CommandHandler("model", bot_handlers.model_command))
-    application.add_handler(CommandHandler("queue", bot_handlers.queue_command))
-    application.add_handler(CommandHandler("cancel", bot_handlers.cancel_command))
-    application.add_handler(CommandHandler("collectpolls", bot_handlers.collect_polls_command))
-    # Auth management
-    application.add_handler(CommandHandler("adduser", bot_handlers.adduser_command))
-    application.add_handler(CommandHandler("removeuser", bot_handlers.removeuser_command))
-    application.add_handler(CommandHandler("listusers", bot_handlers.listusers_command))
-
-    # Messages
-    application.add_handler(MessageHandler(filters.Document.ALL, bot_handlers.handle_document))
-    application.add_handler(MessageHandler(filters.PHOTO, bot_handlers.handle_photo))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, callback_handlers.handle_text))
-
-    # Callbacks
-    application.add_handler(CallbackQueryHandler(callback_handlers.handle_callback))
-
-    # Poll answers
-    application.add_handler(PollAnswerHandler(bot_handlers.handle_poll_answer))
-
-    # Global error handler
-    application.add_error_handler(global_error_handler)
-
-    logger.info("🤖 Bot started!")
-    logger.info(f"⚡ Max workers: {config.MAX_CONCURRENT_IMAGES}")
-    logger.info(f"📦 Queue limit: {config.MAX_QUEUE_SIZE}")
-
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    """Main entry point"""
+    try:
+        print("\n" + "=" * 60)
+        print(f"   {config.BOT_NAME} v{config.BOT_VERSION}")
+        print("   Quiz Generation & Management Bot")
+        print("=" * 60 + "\n")
+        
+        bot = BotApplication()
+        bot.run()
+        
+    except KeyboardInterrupt:
+        print("\n\n👋 Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        print(f"\n\n❌ Fatal error: {e}")
 
 if __name__ == "__main__":
     main()

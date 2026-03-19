@@ -1,63 +1,64 @@
+"""
+Configuration Module - Complete Settings
+All bot configuration and environment variables
+"""
+
 import os
 from pathlib import Path
 
-
 class Config:
-    # Core
+    # Bot Information
+    BOT_NAME = "TSS Bot"
+    BOT_VERSION = "2.1.0"
+    
+    # Telegram Configuration
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    
+    # Gemini AI Configuration
     GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "").split(",")
-    MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
-
-    # Paths
-    TEMP_DIR = Path("temp")
-    OUTPUT_DIR = Path("output")
-    FONTS_DIR = Path("fonts")
-
-    # Processing
-    MAX_CONCURRENT_IMAGES = 10
-    MAX_QUEUE_SIZE = 20
     GEMINI_MODEL = "gemini-2.0-flash-exp"
-    POLL_DELAY = 1.5
-    BATCH_SIZE = 30
-    BATCH_DELAY = 5
+    
+    # MongoDB Configuration
+    MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+    
+    # Authorization Settings
+    AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
+    SUDO_USER_IDS = [int(uid) for uid in os.getenv("SUDO_USER_IDS", "").split(",") if uid.strip()]
+    
+    # Quiz Posting Settings
+    POLL_DELAY = 2  # Seconds between individual quizzes
+    BATCH_SIZE = 10  # Number of quizzes per batch
+    BATCH_DELAY = 5  # Seconds between batches
+    
+    # Live Quiz Settings
+    DEFAULT_QUIZ_TIME = 10  # Seconds per question
+    MAX_LEADERBOARD_DISPLAY = 15  # Max users to show in leaderboard
+    
+    # Task Queue Settings
+    TASK_TIMEOUT = 300  # 5 minutes timeout for stuck tasks
+    
+    # Directory Configuration
+    BASE_DIR = Path(__file__).parent
+    TEMP_DIR = BASE_DIR / "temp"
+    OUTPUT_DIR = BASE_DIR / "output"
+    
+    # Create directories if they don't exist
+    TEMP_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    
+    # Validation
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("❌ TELEGRAM_BOT_TOKEN environment variable not set")
+    
+    if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]:
+        raise ValueError("❌ GEMINI_API_KEYS environment variable not set")
+    
+    # Display configuration
+    print(f"✅ Configuration loaded: {BOT_NAME} v{BOT_VERSION}")
+    print(f"   - Model: {GEMINI_MODEL}")
+    print(f"   - API Keys: {len(GEMINI_API_KEYS)} configured")
+    print(f"   - Auth: {'Enabled' if AUTH_ENABLED else 'Disabled'}")
+    print(f"   - Sudo Users: {len(SUDO_USER_IDS)}")
 
-    # ── Per-user defaults (overridable via /settings) ──────────────────
-    # QUIZ_MARKER : prepended to every quiz question posted to a channel.
-    #   Renders in Telegram poll as:
-    #       [TSS]
-    #
-    #       What is the capital of France?
-    DEFAULT_QUIZ_MARKER = os.getenv("QUIZ_MARKER", "[TSS]")
-
-    # EXPLANATION_TAG : appended inside every explanation.
-    #   Renders in Telegram poll explanation as:
-    #       Paris is the capital of France. [t.me/tss]
-    DEFAULT_EXPLANATION_TAG = os.getenv("EXPLANATION_TAG", "t.me/tss")
-
-    DEFAULT_PDF_MODE = "inline"   # "inline" or "answer_key"
-
-    GENERATION_CONFIG = {
-        "temperature": 0.1,
-        "top_p": 0.95,
-        "top_k": 40,
-        "max_output_tokens": 8192,
-    }
-
-    SAFETY_SETTINGS = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-
-    def __init__(self):
-        if not self.TELEGRAM_BOT_TOKEN:
-            raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required!")
-        if not self.GEMINI_API_KEYS or self.GEMINI_API_KEYS == [""]:
-            raise ValueError("GEMINI_API_KEYS environment variable is required!")
-        self.TEMP_DIR.mkdir(exist_ok=True)
-        self.OUTPUT_DIR.mkdir(exist_ok=True)
-        self.FONTS_DIR.mkdir(exist_ok=True)
-
-
+# Create global config instance
 config = Config()

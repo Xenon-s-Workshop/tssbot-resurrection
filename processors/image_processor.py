@@ -1,15 +1,12 @@
-import logging
-from pathlib import Path
+"""Image Processing Utilities"""
 from PIL import Image
-
-logger = logging.getLogger(__name__)
-
 
 class ImageProcessor:
     @staticmethod
-    async def load_image(path: Path) -> Image.Image:
+    async def load_image(path):
+        """Load image from path"""
         try:
-            return Image.open(path).convert("RGB")
+            return Image.open(path)
         except Exception as e:
-            logger.error(f"Failed to load image {path}: {e}")
+            print(f"❌ Image load error: {e}")
             raise

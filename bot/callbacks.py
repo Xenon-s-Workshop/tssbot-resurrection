@@ -1,486 +1,577 @@
 """
-Callback query and text message handler.
-Covers:
-- Menu navigation (start screen buttons)
-- Mode selection
-- Settings editing (quiz_marker, explanation_tag, pdf_mode)
-- Add channel / group flow
-- Manage / delete channels and groups
-- Post flow: header → destination → posting
-- Export polls
-- All UI disabled after selection (no double-click)
+Bot Callbacks - FIXED Posting Flow
+Complete redesign with proper session management
 """
 
-import json
-import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from config import config
 from database import db
-
-logger = logging.getLogger(__name__)
-
+from processors.poll_collector import poll_collector
+from processors.pdf_exporter import pdf_exporter
+from processors.live_quiz import live_quiz_manager
+from config import config
 
 class CallbackHandlers:
     def __init__(self, bot_handlers):
         self.bot_handlers = bot_handlers
-
-    # ── Dispatcher ────────────────────────────────────────────────────────────
-
+        self.custom_message_sessions = {}
+        self.posting_sessions = {}  # Track active posting sessions
+    
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Main callback router"""
         query = update.callback_query
         await query.answer()
         user_id = update.effective_user.id
         data = query.data
-
-        try:
-            # Menu shortcuts
-            if data == "menu_generate":
-                await query.edit_message_text(
-                    "📄 *Generate Quiz*\n\nSend me a PDF or image and I'll extract/generate MCQs from it.",
-                    parse_mode="Markdown",
-                )
-                return
-            if data == "menu_post":
-                await query.edit_message_text(
-                    "📢 *Post Quiz*\n\nFirst generate a quiz, then tap the *Post Quizzes* button that appears.",
-                    parse_mode="Markdown",
-                )
-                return
-            if data == "menu_settings":
-                from bot.handlers import BotHandlers
-                await self.bot_handlers._send_settings_menu(user_id, query)
-                return
-            if data == "menu_help":
-                await query.edit_message_text(
-                    "Use the /help command for the full guide.",
-                )
-                return
-
-            # Processing mode
-            if data.startswith("mode_"):
-                await self._handle_mode(query, user_id, data, context)
-                return
-
-            # Post flow — start
-            if data.startswith("post_"):
-                session_id = data[5:]
-                from bot.content_processor import ContentProcessor
-                processor = ContentProcessor(self.bot_handlers)
-                await processor.start_post_flow(user_id, session_id, query)
-                return
-
-            # Post flow — show destination after header text entered
-            if data.startswith("show_dest_"):
-                from bot.content_processor import ContentProcessor
-                processor = ContentProcessor(self.bot_handlers)
-                await processor.show_destination_selector(user_id, query, context)
-                return
-
-            # Post flow — skip header
-            if data.startswith("skip_header_"):
-                session_id = data[len("skip_header_"):]
-                state = self.bot_handlers.user_states.get(user_id, {})
-                state["header_message"] = None
-                state["posting_step"] = "destination"
-                self.bot_handlers.user_states[user_id] = state
-                from bot.content_processor import ContentProcessor
-                processor = ContentProcessor(self.bot_handlers)
-                await processor.show_destination_selector(user_id, query, context)
-                return
-
-            # Post flow — channel destination
-            if data.startswith("dest_ch_"):
-                await self._handle_dest(query, user_id, data, context, is_channel=True)
-                return
-
-            # Post flow — group destination
-            if data.startswith("dest_g_"):
-                await self._handle_dest(query, user_id, data, context, is_channel=False)
-                return
-
-            # Settings
-            if data == "set_quiz_marker":
-                settings = db.get_user_settings(user_id)
-                current = settings.get("quiz_marker", config.DEFAULT_QUIZ_MARKER)
-                state = self.bot_handlers.user_states.setdefault(user_id, {})
-                state["awaiting"] = "quiz_marker"
-                await query.edit_message_text(
-                    "✏️ *Change Quiz Marker*\n\n"
-                    "This text is embedded *before every question* posted to your channels.\n\n"
-                    f"Current value: `{current}`\n\n"
-                    "Send the new marker text.\n"
-                    "_Examples: `[TSS]` · `📚 Daily Quiz` · `🧠 MCQ`_",
-                    parse_mode="Markdown",
-                )
-                return
-            if data == "set_explanation_tag":
-                settings = db.get_user_settings(user_id)
-                current = settings.get("explanation_tag", config.DEFAULT_EXPLANATION_TAG)
-                state = self.bot_handlers.user_states.setdefault(user_id, {})
-                state["awaiting"] = "explanation_tag"
-                await query.edit_message_text(
-                    "✏️ *Change Explanation Tag*\n\n"
-                    "This text is appended *inside the explanation* of every question, in square brackets.\n\n"
-                    f"Current value: `{current}`\n\n"
-                    "Send the new tag.\n"
-                    "_Examples: `t.me/mychannel` · `@MyChannel` · `Source: NCERT`_",
-                    parse_mode="Markdown",
-                )
-                return
-            if data == "set_pdf_inline":
-                db.update_user_settings(user_id, "pdf_mode", "inline")
-                await self.bot_handlers._send_settings_menu(user_id, query)
-                return
-            if data == "set_pdf_answer_key":
-                db.update_user_settings(user_id, "pdf_mode", "answer_key")
-                await self.bot_handlers._send_settings_menu(user_id, query)
-                return
-
-            if data == "settings_add_channel":
-                state = self.bot_handlers.user_states.setdefault(user_id, {})
-                state["awaiting"] = "add_channel"
-                await query.edit_message_text(
-                    "📺 *Add Channel*\n\n"
-                    "1. Add this bot as an *admin* to your channel\n"
-                    "2. Forward any message from the channel here, or send the channel ID\n\n"
-                    "_Example: `-1001234567890`_",
-                    parse_mode="Markdown",
-                )
-                return
-            if data == "settings_add_group":
-                state = self.bot_handlers.user_states.setdefault(user_id, {})
-                state["awaiting"] = "add_group"
-                await query.edit_message_text(
-                    "👥 *Add Group*\n\n"
-                    "1. Add this bot to your group\n"
-                    "2. Use /info inside the group to get the ID\n"
-                    "3. Send the group ID here\n\n"
-                    "_Example: `-1009876543210`_",
-                    parse_mode="Markdown",
-                )
-                return
-
-            if data == "settings_manage_channels":
-                await self._manage_channels(query, user_id)
-                return
-            if data == "settings_manage_groups":
-                await self._manage_groups(query, user_id)
-                return
-            if data.startswith("del_channel_"):
-                doc_id = data[len("del_channel_"):]
-                db.delete_channel(doc_id)
-                await self._manage_channels(query, user_id)
-                return
-            if data.startswith("del_group_"):
-                doc_id = data[len("del_group_"):]
-                db.delete_group(doc_id)
-                await self._manage_groups(query, user_id)
-                return
-
-            # Export polls
-            if data == "export_polls":
-                await self._export_polls(query, user_id)
-                return
-
-            logger.warning(f"Unhandled callback: {data}")
-
-        except Exception as e:
-            logger.error(f"Callback error ({data}): {e}", exc_info=True)
-            try:
-                await query.edit_message_text(f"❌ An error occurred: {e}")
-            except Exception:
-                pass
-
-    # ── Text handler (awaiting states) ────────────────────────────────────────
-
-    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        text = update.message.text or ""
-        state = self.bot_handlers.user_states.get(user_id, {})
-        awaiting = state.get("awaiting")
-
-        if awaiting == "quiz_marker":
-            db.update_user_settings(user_id, "quiz_marker", text.strip())
-            state.pop("awaiting", None)
-            await update.message.reply_text(
-                f"✅ *Quiz Marker updated!*\n\n"
-                f"New value: `{text.strip()}`\n\n"
-                f"_Preview of how it appears before a question:_\n"
-                f"`{text.strip()}`\n\n`What is the capital of France?`",
-                parse_mode="Markdown",
-            )
-            return
-
-        if awaiting == "explanation_tag":
-            db.update_user_settings(user_id, "explanation_tag", text.strip())
-            state.pop("awaiting", None)
-            await update.message.reply_text(
-                f"✅ *Explanation Tag updated!*\n\n"
-                f"New value: `{text.strip()}`\n\n"
-                f"_Preview of how it appears in explanations:_\n"
-                f"`Paris is the capital of France. [{text.strip()}]`",
-                parse_mode="Markdown",
-            )
-            return
-
-        if awaiting == "add_channel":
-            await self._save_channel_or_group(update, context, user_id, text, "channel")
-            state.pop("awaiting", None)
-            return
-
-        if awaiting == "add_group":
-            await self._save_channel_or_group(update, context, user_id, text, "group")
-            state.pop("awaiting", None)
-            return
-
-        if state.get("posting_step") == "header":
-            state["header_message"] = text.strip()
-            state["posting_step"] = "destination"
-            session_id = state.get("session_id", "")
-            await update.message.reply_text(
-                f"✅ Header saved:\n\n_{text[:200]}_\n\nNow select a destination.",
-                parse_mode="Markdown",
-            )
-            # Show destination selector
-            keyboard = [[InlineKeyboardButton("➡️ Choose Destination", callback_data=f"show_dest_{session_id}")]]
-            await update.message.reply_text(
-                "Tap below to choose where to post:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-            return
-
-        # Unhandled text
-        await update.message.reply_text(
-            "Send me a PDF, image, or CSV to get started!\nUse /help for the full guide."
-        )
-
-    # ── Mode handler ──────────────────────────────────────────────────────────
-
-    async def _handle_mode(self, query, user_id: int, data: str, context):
-        mode = data.split("_", 1)[1]
+        
+        print(f"🔘 Callback: {data} from user {user_id}")
+        
+        # Poll collection callbacks
+        if data == "poll_export_csv":
+            await poll_collector.handle_export_csv(update, context)
+        elif data == "poll_export_pdf":
+            await poll_collector.handle_export_pdf(update, context)
+        elif data == "poll_clear":
+            await poll_collector.handle_clear(update, context)
+        elif data == "poll_stop":
+            await poll_collector.handle_stop(update, context)
+        
+        # Page selection
+        elif data == "pages_all":
+            await self._handle_pages_all(update, context, user_id, query)
+        elif data == "pages_custom":
+            await self._handle_pages_custom(update, context, user_id, query)
+        
+        # Mode selection
+        elif data.startswith("mode_"):
+            await self._handle_mode_selection(update, context, user_id, query, data)
+        
+        # PDF export
+        elif data.startswith("export_pdf_"):
+            await self._handle_pdf_export(update, context, user_id, query, data)
+        
+        # Live quiz
+        elif data.startswith("livequiz_"):
+            await self._handle_livequiz(update, context, user_id, query, data)
+        
+        # POSTING FLOW - REDESIGNED
+        elif data.startswith("post_"):
+            await self._handle_post_start(update, context, user_id, query, data)
+        
+        # Settings
+        elif data.startswith("settings_"):
+            await self._handle_settings(update, context, user_id, query, data)
+        
+        # Destination selection
+        elif data.startswith("dest_"):
+            await self._handle_destination(update, context, user_id, query, data)
+    
+    async def _handle_post_start(self, update, context, user_id, query, data):
+        """Step 1: Ask for header message"""
+        session_id = data.split("_", 1)[1]
+        
         if user_id not in self.bot_handlers.user_states:
-            await query.edit_message_text("❌ Session expired. Please re-send your file.")
+            await query.edit_message_text("❌ Session expired")
             return
-
-        self.bot_handlers.user_states[user_id]["mode"] = mode
-        mode_label = "Extraction" if mode == "extraction" else "Generation"
-
-        await query.edit_message_text(
-            f"⚙️ *{mode_label} mode selected.*\n\nAdding to processing queue…",
-            parse_mode="Markdown",
-        )
-        await self.bot_handlers.add_to_queue_direct(user_id, None, context)
-
-    # ── Destination handler ───────────────────────────────────────────────────
-
-    async def _handle_dest(self, query, user_id: int, data: str, context, is_channel: bool):
-        # Disable the UI immediately
-        await query.edit_message_text("⏳ *Preparing to post…*", parse_mode="Markdown")
-
+        
+        # Check if already posting
+        if user_id in self.posting_sessions:
+            await query.answer("⚠️ Already posting!")
+            return
+        
+        # Initialize posting session
+        self.posting_sessions[user_id] = {
+            'session_id': session_id,
+            'step': 'header',
+            'custom_message': None,
+            'destination': None
+        }
+        
+        keyboard = [[InlineKeyboardButton("⏭️ Skip Header", callback_data=f"post_skip_{session_id}")]]
+        
+        # Delete old message
         try:
-            if is_channel:
-                # dest_ch_{channel_id}_{session_id}
-                parts = data[len("dest_ch_"):].split("_", 1)
-                chat_id = int(parts[0])
-            else:
-                # dest_g_{group_id}_{session_id}
-                parts = data[len("dest_g_"):].split("_", 1)
-                chat_id = int(parts[0])
-        except (ValueError, IndexError) as e:
-            await query.edit_message_text(f"❌ Invalid destination data: {e}")
-            return
+            await query.message.delete()
+        except:
+            pass
+        
+        # Send fresh message for header
+        await context.bot.send_message(
+            user_id,
+            "📢 **Step 1/3: Header Message**
 
+"
+            "Send your announcement message
+"
+            "or click Skip to proceed.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    
+    async def _handle_destination(self, update, context, user_id, query, data):
+        """Step 3: Post to selected destination"""
+        # Get session
+        if user_id not in self.posting_sessions:
+            await query.answer("❌ Session expired")
+            return
+        
+        session = self.posting_sessions[user_id]
+        custom_msg = session.get('custom_message')
+        
+        # Parse destination
+        if data.startswith("dest_ch_"):
+            chat_id = int(data.split("_")[-1])
+            thread_id = None
+        elif data.startswith("dest_gr_"):
+            group_id = int(data.split("_")[-1])
+            # For groups, ask for topic ID
+            session['selected_group'] = group_id
+            session['step'] = 'topic_id'
+            
+            await query.edit_message_text(
+                "🔢 **Step 3/3: Topic ID**
+
+"
+                "Send topic ID or send 0 for main chat.",
+                parse_mode='Markdown'
+            )
+            return
+        else:
+            await query.answer("❌ Invalid destination")
+            return
+        
+        # Delete selection message IMMEDIATELY
+        try:
+            await query.message.delete()
+        except:
+            pass
+        
+        # Clear session to prevent re-click
+        del self.posting_sessions[user_id]
+        
+        # Start posting
+        msg = await context.bot.send_message(user_id, "📢 **Step 3/3: Posting...**")
+        
         from bot.content_processor import ContentProcessor
         processor = ContentProcessor(self.bot_handlers)
         await processor.post_quizzes_to_destination(
-            user_id, chat_id, None, context, query.message
+            user_id, chat_id, thread_id, context, msg, custom_msg
         )
-
-    # ── Channel / Group management ────────────────────────────────────────────
-
-    async def _save_channel_or_group(self, update, context, user_id, text, kind):
-        text = text.strip()
-        chat_id = None
-        name = None
-
-        # Try to parse as numeric ID
-        try:
-            chat_id = int(text)
-        except ValueError:
-            # Try as @username
-            try:
-                chat = await context.bot.get_chat(text)
-                chat_id = chat.id
-                name = chat.title or chat.username or text
-            except Exception as e:
-                await update.message.reply_text(f"❌ Could not find chat: {e}")
+    
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text input"""
+        user_id = update.effective_user.id
+        text = update.message.text.strip()
+        
+        # Check if waiting for header message
+        if user_id in self.posting_sessions:
+            session = self.posting_sessions[user_id]
+            
+            if session['step'] == 'header':
+                # Save header message
+                session['custom_message'] = text
+                session['step'] = 'destination'
+                
+                await update.message.reply_text("✅ Header saved")
+                await self._send_destination_selection(user_id, context)
                 return
-
-        if chat_id and not name:
-            try:
-                chat = await context.bot.get_chat(chat_id)
-                name = chat.title or chat.username or str(chat_id)
-            except Exception:
-                name = str(chat_id)
-
-        if kind == "channel":
-            db.add_channel(user_id, chat_id, name)
-            await update.message.reply_text(
-                f"✅ Channel *{name}* (`{chat_id}`) added!", parse_mode="Markdown"
-            )
-        else:
-            db.add_group(user_id, chat_id, name)
-            await update.message.reply_text(
-                f"✅ Group *{name}* (`{chat_id}`) added!", parse_mode="Markdown"
-            )
-
-    async def _manage_channels(self, query, user_id: int):
-        channels = db.get_user_channels(user_id)
-        if not channels:
-            await query.edit_message_text("📭 No channels configured. Use /settings → Add Channel.")
+            
+            elif session['step'] == 'topic_id':
+                # Handle topic ID
+                try:
+                    topic_id = int(text)
+                    group_id = session['selected_group']
+                    custom_msg = session.get('custom_message')
+                    thread_id = topic_id if topic_id > 0 else None
+                    
+                    # Clear session
+                    del self.posting_sessions[user_id]
+                    
+                    msg = await update.message.reply_text("📢 **Posting...**")
+                    
+                    from bot.content_processor import ContentProcessor
+                    processor = ContentProcessor(self.bot_handlers)
+                    await processor.post_quizzes_to_destination(
+                        user_id, group_id, thread_id, context, msg, custom_msg
+                    )
+                    return
+                except:
+                    await update.message.reply_text("❌ Invalid topic ID")
+                    return
+        
+        # PDF name input
+        if pdf_exporter.is_waiting_for_name(user_id):
+            await pdf_exporter.handle_pdf_name_input(update, context)
             return
+        
+        # Settings text input
+        if user_id in self.bot_handlers.user_states:
+            waiting_for = self.bot_handlers.user_states[user_id].get('waiting_for')
+            
+            if waiting_for in ['quiz_marker', 'explanation_tag']:
+                await self._handle_settings_text_input(update, context, user_id, text, waiting_for)
+                return
+        
+        # Other text handlers (page range, channel/group addition, etc.)
+        if user_id not in self.bot_handlers.user_states:
+            return
+        
+        waiting_for = self.bot_handlers.user_states[user_id].get('waiting_for')
+        
+        if waiting_for == 'page_range':
+            await self._handle_page_range_input(update, context, user_id, text)
+        elif waiting_for == 'add_channel':
+            await self._handle_add_channel_input(update, context, user_id, text)
+        elif waiting_for == 'add_group':
+            await self._handle_add_group_input(update, context, user_id, text)
+    
+    async def _send_destination_selection(self, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Send destination selection menu"""
+        channels = db.get_user_channels(user_id)
+        groups = db.get_user_groups(user_id)
+        
+        if not channels and not groups:
+            await context.bot.send_message(
+                user_id,
+                "❌ **No Destinations**
+
+Use /settings to add channels/groups.",
+                parse_mode='Markdown'
+            )
+            if user_id in self.posting_sessions:
+                del self.posting_sessions[user_id]
+            return
+        
         keyboard = []
         for ch in channels:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🗑️ {ch['channel_name']}",
-                    callback_data=f"del_channel_{ch['_id']}",
-                )
-            ])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_settings")])
-        await query.edit_message_text(
-            "📺 *Your Channels*\n\nTap a channel to remove it:",
-            parse_mode="Markdown",
+            keyboard.append([InlineKeyboardButton(
+                f"📺 {ch['channel_name']}",
+                callback_data=f"dest_ch_{ch['channel_id']}"
+            )])
+        for gr in groups:
+            keyboard.append([InlineKeyboardButton(
+                f"👥 {gr['group_name']}",
+                callback_data=f"dest_gr_{gr['group_id']}"
+            )])
+        
+        await context.bot.send_message(
+            user_id,
+            "📢 **Step 2/3: Select Destination**",
             reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-
-    async def _manage_groups(self, query, user_id: int):
-        groups = db.get_user_groups(user_id)
-        if not groups:
-            await query.edit_message_text("📭 No groups configured. Use /settings → Add Group.")
+    
+    # Placeholder methods for other callbacks
+    async def _handle_pages_all(self, update, context, user_id, query):
+        if user_id not in self.bot_handlers.user_states:
+            await query.edit_message_text("❌ Session expired")
             return
-        keyboard = []
-        for g in groups:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🗑️ {g['group_name']}",
-                    callback_data=f"del_group_{g['_id']}",
-                )
-            ])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_settings")])
+        
+        keyboard = [
+            [InlineKeyboardButton("📤 Extraction", callback_data="mode_extraction")],
+            [InlineKeyboardButton("✨ Generation", callback_data="mode_generation")]
+        ]
         await query.edit_message_text(
-            "👥 *Your Groups*\n\nTap a group to remove it:",
-            parse_mode="Markdown",
+            "📄 **All Pages Selected**
+
+Choose processing mode:",
             reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-
-    # ── Poll export ───────────────────────────────────────────────────────────
-
-    async def _export_polls(self, query, user_id: int):
-        polls = db.get_user_polls(user_id)
-        if not polls:
-            await query.edit_message_text("📭 No polls to export.")
+    
+    async def _handle_pages_custom(self, update, context, user_id, query):
+        if user_id not in self.bot_handlers.user_states:
+            await query.edit_message_text("❌ Session expired")
             return
+        
+        self.bot_handlers.user_states[user_id]['waiting_for'] = 'page_range'
+        await query.edit_message_text(
+            "🔢 **Page Range**
 
-        await query.edit_message_text("⏳ *Building exports…*", parse_mode="Markdown")
-
-        from io import BytesIO, StringIO
-        import csv as csv_mod
+"
+            "Send page range (e.g., `5-15`)",
+            parse_mode='Markdown'
+        )
+    
+    async def _handle_mode_selection(self, update, context, user_id, query, data):
+        mode = data.split("_")[1]
+        if user_id not in self.bot_handlers.user_states:
+            await query.edit_message_text("❌ Session expired")
+            return
+        
+        self.bot_handlers.user_states[user_id]['mode'] = mode
+        await query.edit_message_text("⏳ **Queuing task...**")
+        
+        page_range = self.bot_handlers.user_states[user_id].get('page_range')
+        await self.bot_handlers.add_to_queue_direct(user_id, page_range, context)
+    
+    async def _handle_pdf_export(self, update, context, user_id, query, data):
+        session_id = data.split("_", 2)[2]
+        
+        if user_id not in self.bot_handlers.user_states:
+            await query.edit_message_text("❌ Session expired")
+            return
+        
+        questions = self.bot_handlers.user_states[user_id].get('questions', [])
+        if not questions:
+            await query.answer("❌ No questions")
+            return
+        
+        await query.edit_message_text("📄 **Generating PDF...**")
+        
         from datetime import datetime
-        from processors.pdf_generator import generate_pdf
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        settings = db.get_user_settings(user_id)
-        pdf_mode = settings.get("pdf_mode", "inline")
-
-        # ── Normalise poll records into question dicts ─────────────────────
-        # Polls stored by handle_poll_answer contain: poll_id, option_ids
-        # We reconstruct best-effort question dicts for export.
-        questions = []
-        raw_rows = []
-        for p in polls:
-            data = p.get("data") or {}
-            poll_id = p.get("poll_id") or data.get("poll_id") or "unknown"
-            option_ids = data.get("option_ids") or []
-            chosen = ", ".join(str(o) for o in option_ids) if option_ids else "—"
-            raw_rows.append({
-                "poll_id": poll_id,
-                "user_id": str(data.get("user_id") or ""),
-                "chosen_option_ids": chosen,
-            })
-            # Build a minimal question dict so the PDF renderer works
-            questions.append({
-                "question_description": f"Poll ID: {poll_id}",
-                "options": [f"Option {o}" for o in option_ids] or ["(no answer)"],
-                "correct_answer_index": 0,
-                "correct_option": "A",
-                "explanation": f"User chose option(s): {chosen}",
-            })
-
-        errors = []
-
-        # ── 1. JSON ────────────────────────────────────────────────────────
+        pdf_title = f"Quiz_{timestamp}"
+        pdf_path = config.OUTPUT_DIR / f"{pdf_title}.pdf"
+        
         try:
-            json_payload = json.dumps(raw_rows, ensure_ascii=False, indent=2).encode("utf-8")
-            json_buf = BytesIO(json_payload)
-            await query.message.reply_document(
-                json_buf,
-                filename=f"polls_{timestamp}.json",
-                caption=f"📋 *JSON Export* — {len(raw_rows)} poll records",
-                parse_mode="Markdown",
-            )
+            settings = db.get_user_settings(user_id)
+            pdf_mode = settings.get('pdf_mode', 'mode1')
+            
+            cleaned = pdf_exporter.cleanup_questions(questions)
+            pdf_exporter.generate_beautiful_pdf(cleaned, pdf_path, pdf_title, mode=pdf_mode)
+            
+            with open(pdf_path, 'rb') as f:
+                await context.bot.send_document(
+                    user_id, f,
+                    filename=f"{pdf_title}.pdf",
+                    caption=f"📄 PDF • {len(questions)}Q • {pdf_mode}"
+                )
+            
+            await query.message.delete()
+            pdf_path.unlink(missing_ok=True)
+            
         except Exception as e:
-            errors.append(f"JSON: {e}")
+            await query.edit_message_text(
+                f"❌ **PDF Failed**
 
-        # ── 2. CSV ─────────────────────────────────────────────────────────
+`{str(e)[:150]}`",
+                parse_mode='Markdown'
+            )
+    
+    async def _handle_livequiz(self, update, context, user_id, query, data):
+        # Placeholder - implement based on your requirements
+        await query.answer("Live quiz coming soon")
+    
+    async def _handle_settings(self, update, context, user_id, query, data):
+        # Placeholder - implement full settings UI
+        await query.answer("Settings handler")
+    
+    async def _handle_page_range_input(self, update, context, user_id, text):
         try:
-            csv_buf = StringIO()
-            writer = csv_mod.DictWriter(
-                csv_buf,
-                fieldnames=["poll_id", "user_id", "chosen_option_ids"],
-            )
-            writer.writeheader()
-            writer.writerows(raw_rows)
-            csv_bytes = BytesIO(csv_buf.getvalue().encode("utf-8"))
-            await query.message.reply_document(
-                csv_bytes,
-                filename=f"polls_{timestamp}.csv",
-                caption=f"📊 *CSV Export* — {len(raw_rows)} poll records",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            errors.append(f"CSV: {e}")
+            if '-' not in text:
+                await update.message.reply_text("❌ Format: `5-15`", parse_mode='Markdown')
+                return
+            
+            parts = text.split('-')
+            start, end = int(parts[0].strip()), int(parts[1].strip())
+            
+            if start < 1 or end < start:
+                await update.message.reply_text("❌ Invalid range")
+                return
+            
+            self.bot_handlers.user_states[user_id]['page_range'] = (start, end)
+            self.bot_handlers.user_states[user_id]['waiting_for'] = None
+            
+            keyboard = [
+                [InlineKeyboardButton("📤 Extraction", callback_data="mode_extraction")],
+                [InlineKeyboardButton("✨ Generation", callback_data="mode_generation")]
+            ]
+            await update.message.reply_text(
+                f"✅ **Pages {start}-{end}**
 
-        # ── 3. PDF ─────────────────────────────────────────────────────────
-        try:
-            pdf_buf = generate_pdf(
-                questions,
-                mode=pdf_mode,
-                engine="reportlab",
-                title=f"Poll Report — {timestamp}",
+Choose mode:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
-            await query.message.reply_document(
-                pdf_buf,
-                filename=f"polls_{timestamp}.pdf",
-                caption=(
-                    f"📄 *PDF Export* — {len(questions)} poll records\n"
-                    f"Mode: `{pdf_mode}`"
+        except:
+            await update.message.reply_text("❌ Invalid format. Use: `5-15`", parse_mode='Markdown')
+    
+    async def _handle_add_channel_input(self, update, context, user_id, text):
+        try:
+            parts = text.split(" ", 1)
+            if len(parts) < 2:
+                await update.message.reply_text("❌ Format: `id name`", parse_mode='Markdown')
+                return
+            
+            db.add_channel(user_id, int(parts[0]), parts[1])
+            await update.message.reply_text("✅ **Channel Added**")
+            del self.bot_handlers.user_states[user_id]
+        except:
+            await update.message.reply_text("❌ Invalid channel ID")
+    
+    async def _handle_add_group_input(self, update, context, user_id, text):
+        try:
+            parts = text.split(" ", 1)
+            if len(parts) < 2:
+                await update.message.reply_text("❌ Format: `id name`", parse_mode='Markdown')
+                return
+            
+            db.add_group(user_id, int(parts[0]), parts[1])
+            await update.message.reply_text("✅ **Group Added**")
+            del self.bot_handlers.user_states[user_id]
+        except:
+            await update.message.reply_text("❌ Invalid group ID")
+
+    # ===== SETTINGS HANDLERS - ADDED =====
+    
+    async def _handle_settings(self, update, context, user_id, query, data):
+        """Settings callback handler"""
+        
+        if data == "settings_main" or data == "start_settings":
+            await self._show_settings_menu(update, context, user_id, query)
+        
+        elif data == "settings_quiz_marker":
+            self.bot_handlers.user_states[user_id] = {'waiting_for': 'quiz_marker'}
+            await query.edit_message_text(
+                "🎯 **Quiz Marker**\n\n"
+                "Current: `{}`\n\n"
+                "Send new quiz marker text:".format(
+                    db.get_user_settings(user_id).get('quiz_marker', '🎯 Quiz')
                 ),
-                parse_mode="Markdown",
+                parse_mode='Markdown'
             )
-        except Exception as e:
-            errors.append(f"PDF: {e}")
-
-        # ── Summary ────────────────────────────────────────────────────────
-        if errors:
+        
+        elif data == "settings_exp_tag":
+            self.bot_handlers.user_states[user_id] = {'waiting_for': 'explanation_tag'}
             await query.edit_message_text(
-                f"⚠️ Export done with errors:\n" + "\n".join(f"• {e}" for e in errors),
-                parse_mode="Markdown",
+                "📝 **Explanation Tag**\n\n"
+                "Current: `{}`\n\n"
+                "Send new explanation tag:".format(
+                    db.get_user_settings(user_id).get('explanation_tag', 'Exp')
+                ),
+                parse_mode='Markdown'
             )
-        else:
+        
+        elif data == "settings_pdf_mode":
+            keyboard = [
+                [InlineKeyboardButton("📄 Mode 1: Answers at End", callback_data="pdf_mode1")],
+                [InlineKeyboardButton("📝 Mode 2: Inline Answers", callback_data="pdf_mode2")],
+                [InlineKeyboardButton("🔙 Back", callback_data="settings_main")]
+            ]
+            
+            current_mode = db.get_user_settings(user_id).get('pdf_mode', 'mode1')
+            
             await query.edit_message_text(
-                f"✅ *Export complete!*\n{len(raw_rows)} poll records sent as CSV, JSON, and PDF.",
-                parse_mode="Markdown",
+                "📄 **PDF Mode**\n\n"
+                f"Current: `{current_mode}`\n\n"
+                "**Mode 1:** Questions only, answers at end\n"
+                "**Mode 2:** Each question with inline answer\n\n"
+                "Select mode:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
+        
+        elif data == "pdf_mode1" or data == "pdf_mode2":
+            mode = "mode1" if data == "pdf_mode1" else "mode2"
+            db.set_pdf_mode(user_id, mode)
+            await query.answer(f"✅ PDF Mode set to {mode}")
+            await self._show_settings_menu(update, context, user_id, query)
+        
+        elif data == "settings_manage_channels":
+            channels = db.get_user_channels(user_id)
+            if not channels:
+                await query.edit_message_text(
+                    "❌ **No Channels**\n\nAdd channels using /settings → Add Channel",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            keyboard = []
+            for ch in channels:
+                keyboard.append([InlineKeyboardButton(
+                    f"📺 {ch['channel_name']}", 
+                    callback_data=f"ch_view_{ch['_id']}"
+                )])
+            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="settings_main")])
+            
+            await query.edit_message_text(
+                "📺 **Your Channels**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        
+        elif data == "settings_manage_groups":
+            groups = db.get_user_groups(user_id)
+            if not groups:
+                await query.edit_message_text(
+                    "❌ **No Groups**\n\nAdd groups using /settings → Add Group",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            keyboard = []
+            for gr in groups:
+                keyboard.append([InlineKeyboardButton(
+                    f"👥 {gr['group_name']}", 
+                    callback_data=f"gr_view_{gr['_id']}"
+                )])
+            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="settings_main")])
+            
+            await query.edit_message_text(
+                "👥 **Your Groups**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        
+        elif data == "settings_add_channel":
+            self.bot_handlers.user_states[user_id] = {'waiting_for': 'add_channel'}
+            await query.edit_message_text(
+                "📺 **Add Channel**\n\n"
+                "Format: `channel_id channel_name`\n"
+                "Example: `-1001234567890 My Channel`",
+                parse_mode='Markdown'
+            )
+        
+        elif data == "settings_add_group":
+            self.bot_handlers.user_states[user_id] = {'waiting_for': 'add_group'}
+            await query.edit_message_text(
+                "👥 **Add Group**\n\n"
+                "Format: `group_id group_name`\n"
+                "Example: `-1001234567890 My Group`",
+                parse_mode='Markdown'
+            )
+    
+    async def _show_settings_menu(self, update, context, user_id, query):
+        """Show main settings menu"""
+        settings = db.get_user_settings(user_id)
+        
+        keyboard = [
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="settings_manage_channels")],
+            [InlineKeyboardButton("👥 Manage Groups", callback_data="settings_manage_groups")],
+            [InlineKeyboardButton("🎯 Quiz Marker", callback_data="settings_quiz_marker")],
+            [InlineKeyboardButton("📝 Explanation Tag", callback_data="settings_exp_tag")],
+            [InlineKeyboardButton("📄 PDF Mode", callback_data="settings_pdf_mode")],
+        ]
+        
+        await query.edit_message_text(
+            f"⚙️ **Settings**\n\n"
+            f"**Current Configuration:**\n"
+            f"• Quiz Marker: `{settings.get('quiz_marker', '🎯 Quiz')}`\n"
+            f"• Explanation Tag: `{settings.get('explanation_tag', 'Exp')}`\n"
+            f"• PDF Mode: `{settings.get('pdf_mode', 'mode1')}`\n\n"
+            f"Select setting to modify:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
+    # Add to handle_text method - Settings text handlers
+    async def _handle_settings_text_input(self, update, context, user_id, text, waiting_for):
+        """Handle settings text input"""
+        
+        if waiting_for == 'quiz_marker':
+            db.set_quiz_marker(user_id, text)
+            await update.message.reply_text(
+                f"✅ **Quiz Marker Updated**\n\nNew: `{text}`",
+                parse_mode='Markdown'
+            )
+            del self.bot_handlers.user_states[user_id]
+        
+        elif waiting_for == 'explanation_tag':
+            db.set_explanation_tag(user_id, text)
+            await update.message.reply_text(
+                f"✅ **Explanation Tag Updated**\n\nNew: `{text}`",
+                parse_mode='Markdown'
+            )
+            del self.bot_handlers.user_states[user_id]
