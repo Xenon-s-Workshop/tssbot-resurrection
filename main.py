@@ -1,6 +1,6 @@
 """
 TSS Telegram Bot - Main Entry Point
-Complete quiz management bot with Gemini AI integration
+Complete quiz bot with all Phase 1 fixes
 """
 
 import asyncio
@@ -26,7 +26,6 @@ from utils.queue_manager import task_queue
 from processors.pdf_processor import PDFProcessor
 from utils.api_rotator import GeminiAPIRotator
 
-# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -35,38 +34,32 @@ logger = logging.getLogger(__name__)
 
 class BotApplication:
     def __init__(self):
-        print("🔧 Initializing bot application...")
+        print("🔧 Initializing...")
         
-        # Initialize API rotator
-        print("🔑 Initializing Gemini API rotator...")
+        print("🔑 API rotator...")
         self.api_rotator = GeminiAPIRotator(config.GEMINI_API_KEYS)
         
-        # Initialize PDF processor with API rotator
-        print("📄 Initializing PDF processor...")
+        print("📄 PDF processor...")
         self.pdf_processor = PDFProcessor(self.api_rotator)
         
-        # Initialize bot handlers - NO ARGUMENT NEEDED
-        print("🎮 Initializing handlers...")
+        print("🎮 Handlers...")
         self.bot_handlers = BotHandlers()
         
-        # Initialize callback handlers
-        print("🔘 Initializing callbacks...")
+        print("🔘 Callbacks...")
         self.callback_handlers = CallbackHandlers(self.bot_handlers)
         
-        # Create application
-        print("🤖 Creating bot application...")
+        print("🤖 Application...")
         self.application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
         
-        # Register handlers
         self._register_handlers()
         
-        print("✅ Bot application initialized successfully!")
+        print("✅ Initialized")
     
     def _register_handlers(self):
-        """Register all command and message handlers"""
+        """Register handlers"""
         app = self.application
         
-        # ==================== COMMAND HANDLERS ====================
+        # Commands
         app.add_handler(CommandHandler("start", self.bot_handlers.start_command))
         app.add_handler(CommandHandler("help", self.bot_handlers.help_command))
         app.add_handler(CommandHandler("settings", self.bot_handlers.settings_command))
@@ -77,58 +70,56 @@ class BotApplication:
         app.add_handler(CommandHandler("model", self.bot_handlers.model_command))
         app.add_handler(CommandHandler("livequiz", self.bot_handlers.livequiz_command))
         
-        # Admin commands
+        # Admin
         app.add_handler(CommandHandler("authorize", self.bot_handlers.authorize_command))
         app.add_handler(CommandHandler("revoke", self.bot_handlers.revoke_command))
         app.add_handler(CommandHandler("users", self.bot_handlers.users_command))
         
-        # ==================== MESSAGE HANDLERS ====================
-        # Document handler (PDF)
+        # Files
         app.add_handler(MessageHandler(
             filters.Document.PDF | filters.Document.FileExtension("pdf"),
             self.bot_handlers.handle_document
         ))
         
-        # CSV handler
         app.add_handler(MessageHandler(
             filters.Document.FileExtension("csv"),
             self.bot_handlers.handle_csv
         ))
         
-        # Photo handler
+        app.add_handler(MessageHandler(
+            filters.Document.FileExtension("json"),
+            self.bot_handlers.handle_json
+        ))
+        
         app.add_handler(MessageHandler(
             filters.PHOTO,
             self.bot_handlers.handle_photo
         ))
         
-        # Text handler (for various input states)
         app.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self.callback_handlers.handle_text
         ))
         
-        # ==================== CALLBACK HANDLERS ====================
+        # Callbacks
         app.add_handler(CallbackQueryHandler(self.callback_handlers.handle_callback))
         
-        # ==================== POLL ANSWER HANDLER ====================
+        # Poll answers
         app.add_handler(PollAnswerHandler(live_quiz_manager.handle_poll_answer))
         
-        print("✅ All handlers registered")
+        print("✅ Handlers registered")
     
     async def post_init(self, application: Application):
-        """Post-initialization setup"""
-        print("🔧 Running post-initialization...")
+        """Post-init"""
+        print("🔧 Post-init...")
         
-        # Set application reference for poll collector
         poll_collector.set_application(application)
-        
-        # Store callback handlers in bot_data for access from commands
         application.bot_data['callback_handlers'] = self.callback_handlers
         
-        print("✅ Post-initialization complete")
+        print("✅ Post-init complete")
     
     async def process_queue(self):
-        """Background task to process queue"""
+        """Process queue"""
         from bot.content_processor import ContentProcessor
         
         while True:
@@ -140,13 +131,11 @@ class BotApplication:
                     state = task['state']
                     context = task['context']
                     
-                    print(f"⚙️ Processing task for user {user_id}")
+                    print(f"⚙️ Processing user {user_id}")
                     
                     try:
-                        # Mark as processing
                         task_queue.set_processing(user_id, True)
                         
-                        # Process content
                         processor = ContentProcessor(self.bot_handlers)
                         await processor.process_content(
                             user_id,
@@ -158,75 +147,62 @@ class BotApplication:
                         )
                         
                     except Exception as e:
-                        print(f"❌ Error processing task for user {user_id}: {e}")
+                        print(f"❌ Error user {user_id}: {e}")
                         import traceback
                         traceback.print_exc()
                         
                         try:
                             await context.bot.send_message(
                                 user_id,
-                                f"❌ Processing failed:\n`{str(e)[:200]}`",
+                                f"❌ Failed: `{str(e)[:150]}`",
                                 parse_mode='Markdown'
                             )
                         except:
                             pass
                     
                     finally:
-                        # Always clear processing state
                         task_queue.set_processing(user_id, False)
                 
-                # Small delay
                 await asyncio.sleep(1)
             
             except Exception as e:
-                print(f"❌ Queue processor error: {e}")
+                print(f"❌ Queue error: {e}")
                 await asyncio.sleep(5)
     
     def run(self):
-        """Run the bot"""
+        """Run bot"""
         print("=" * 60)
         print(f"🚀 Starting {config.BOT_NAME}")
         print("=" * 60)
         
-        # Run post_init
-        self.application.post_init = self.post_init
-        
-        # Start queue processor in the event loop
         async def startup():
-            """Startup tasks"""
-            # Create background task for queue processing
             asyncio.create_task(self.process_queue())
         
-        # Add startup task
         self.application.post_init = lambda app: asyncio.gather(
             self.post_init(app),
             startup()
         )
         
-        # Start polling
-        print("🎯 Bot is running! Press Ctrl+C to stop.")
+        print("🎯 Running")
         self.application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True
         )
 
 def main():
-    """Main entry point"""
+    """Main"""
     try:
-        # Print startup banner
         print("\n" + "=" * 60)
         print(f"   {config.BOT_NAME} v{config.BOT_VERSION}")
-        print("   Telegram Quiz Bot with Gemini AI")
         print("=" * 60 + "\n")
         
-        # Initialize and run bot
         bot = BotApplication()
         bot.run()
         
     except KeyboardInterrupt:
-        print("\n\n👋 Bot stopped by user")
+        print("\n\n👋 Stopped")
     except Exception as e:
-        print(f"\n\n❌ Fatal error: {e}")
+        print(f"\n\n❌ Fatal: {e}")
         import traceback
         traceback.print_exc()
 
