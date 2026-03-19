@@ -1,93 +1,158 @@
-import os
-from typing import Dict, List
-from datetime import datetime
+"""
+Database Module - MongoDB Integration
+Handles user authorization, channels, groups, and settings
+WITH DEFAULT DESTINATION SUPPORT
+"""
+
 from pymongo import MongoClient
-from bson import ObjectId
 from config import config
 
-class MongoDB:
+class Database:
     def __init__(self):
         self.client = MongoClient(config.MONGODB_URI)
-        self.db = self.client['telegram_quiz_bot']
-        self.users = self.db['users']
-        self.channels = self.db['channels']
-        self.groups = self.db['groups']
-        self.authorized_users = self.db['authorized_users']
+        self.db = self.client['tss_bot']
+        
+        # Initialize collections
+        self.users = self.db.users
+        self.channels = self.db.channels
+        self.groups = self.db.groups
+        self.user_settings = self.db.user_settings
+        
         print("✅ MongoDB connected")
-        self._init_sudo_users()
-    
-    def _init_sudo_users(self):
+        
+        # Initialize sudo users
         for user_id in config.SUDO_USER_IDS:
-            self.authorized_users.update_one(
-                {'user_id': user_id},
-                {'$set': {'user_id': user_id, 'is_sudo': True, 'authorized_at': datetime.now()}},
-                upsert=True
-            )
-        if config.SUDO_USER_IDS:
-            print(f"✅ {len(config.SUDO_USER_IDS)} sudo users initialized")
+            self.authorize_user(user_id)
+        print(f"✅ {len(config.SUDO_USER_IDS)} sudo users initialized")
     
-    def is_authorized(self, user_id: int) -> bool:
+    # ==================== USER AUTHORIZATION ====================
+    
+    def is_user_authorized(self, user_id: int) -> bool:
+        """Check if user is authorized"""
         if not config.AUTH_ENABLED:
             return True
-        return self.authorized_users.find_one({'user_id': user_id}) is not None
+        return self.users.find_one({'user_id': user_id}) is not None
     
-    def is_sudo(self, user_id: int) -> bool:
-        user = self.authorized_users.find_one({'user_id': user_id})
-        return user and user.get('is_sudo', False)
-    
-    def authorize_user(self, user_id: int, authorized_by: int):
-        self.authorized_users.update_one(
+    def authorize_user(self, user_id: int):
+        """Authorize a user"""
+        self.users.update_one(
             {'user_id': user_id},
-            {'$set': {'user_id': user_id, 'authorized_by': authorized_by, 'authorized_at': datetime.now(), 'is_sudo': False}},
+            {'$set': {'user_id': user_id, 'authorized': True}},
             upsert=True
         )
     
     def revoke_user(self, user_id: int):
-        self.authorized_users.delete_one({'user_id': user_id})
+        """Revoke user authorization"""
+        self.users.delete_one({'user_id': user_id})
     
-    def get_authorized_users(self) -> List[Dict]:
-        return list(self.authorized_users.find({}))
+    def get_authorized_users(self):
+        """Get all authorized users"""
+        return list(self.users.find())
     
-    def get_user_settings(self, user_id: int) -> Dict:
-        user = self.users.find_one({'user_id': user_id})
-        if not user:
-            default = {
-                'user_id': user_id,
-                'quiz_marker': os.getenv("QUIZ_MARKER", "[TSS]"),
-                'explanation_tag': os.getenv("EXPLANATION_TAG", "t.me/tss"),
-                'created_at': datetime.now()
-            }
-            self.users.insert_one(default)
-            return default
-        return user
-    
-    def update_user_settings(self, user_id: int, key: str, value: str):
-        self.users.update_one({'user_id': user_id}, {'$set': {key: value, 'updated_at': datetime.now()}}, upsert=True)
+    # ==================== CHANNELS ====================
     
     def add_channel(self, user_id: int, channel_id: int, channel_name: str):
-        existing = self.channels.find_one({'user_id': user_id, 'channel_id': channel_id})
-        if existing:
-            self.channels.update_one({'_id': existing['_id']}, {'$set': {'channel_name': channel_name}})
-        else:
-            self.channels.insert_one({'user_id': user_id, 'channel_id': channel_id, 'channel_name': channel_name, 'created_at': datetime.now()})
+        """Add a channel"""
+        self.channels.insert_one({
+            'user_id': user_id,
+            'channel_id': channel_id,
+            'channel_name': channel_name
+        })
     
-    def add_group(self, user_id: int, group_id: int, group_name: str):
-        existing = self.groups.find_one({'user_id': user_id, 'group_id': group_id})
-        if existing:
-            self.groups.update_one({'_id': existing['_id']}, {'$set': {'group_name': group_name}})
-        else:
-            self.groups.insert_one({'user_id': user_id, 'group_id': group_id, 'group_name': group_name, 'created_at': datetime.now()})
-    
-    def get_user_channels(self, user_id: int) -> List[Dict]:
+    def get_user_channels(self, user_id: int):
+        """Get user's channels"""
         return list(self.channels.find({'user_id': user_id}))
     
-    def get_user_groups(self, user_id: int) -> List[Dict]:
+    def delete_channel(self, channel_id: str):
+        """Delete a channel by MongoDB _id"""
+        from bson.objectid import ObjectId
+        self.channels.delete_one({'_id': ObjectId(channel_id)})
+    
+    # ==================== GROUPS ====================
+    
+    def add_group(self, user_id: int, group_id: int, group_name: str):
+        """Add a group"""
+        self.groups.insert_one({
+            'user_id': user_id,
+            'group_id': group_id,
+            'group_name': group_name
+        })
+    
+    def get_user_groups(self, user_id: int):
+        """Get user's groups"""
         return list(self.groups.find({'user_id': user_id}))
     
-    def delete_channel(self, channel_doc_id: str):
-        self.channels.delete_one({'_id': ObjectId(channel_doc_id)})
+    def delete_group(self, group_id: str):
+        """Delete a group by MongoDB _id"""
+        from bson.objectid import ObjectId
+        self.groups.delete_one({'_id': ObjectId(group_id)})
     
-    def delete_group(self, group_doc_id: str):
-        self.groups.delete_one({'_id': ObjectId(group_doc_id)})
+    # ==================== USER SETTINGS ====================
+    
+    def get_user_settings(self, user_id: int) -> dict:
+        """Get user settings"""
+        settings = self.user_settings.find_one({'user_id': user_id})
+        
+        if not settings:
+            # Create default settings
+            settings = {
+                'user_id': user_id,
+                'quiz_marker': '🎯',
+                'explanation_tag': 'Exp'
+            }
+            self.user_settings.insert_one(settings)
+        
+        return settings
+    
+    def update_user_settings(self, user_id: int, settings: dict):
+        """Update user settings"""
+        self.user_settings.update_one(
+            {'user_id': user_id},
+            {'$set': settings},
+            upsert=True
+        )
+    
+    # ==================== DEFAULT DESTINATIONS ====================
+    
+    def set_default_channel(self, user_id: int, channel_id: int):
+        """Set default channel for user"""
+        self.user_settings.update_one(
+            {'user_id': user_id},
+            {'$set': {'default_channel': channel_id}},
+            upsert=True
+        )
+    
+    def set_default_group(self, user_id: int, group_id: int):
+        """Set default group for user"""
+        self.user_settings.update_one(
+            {'user_id': user_id},
+            {'$set': {'default_group': group_id}},
+            upsert=True
+        )
+    
+    def get_default_channel(self, user_id: int):
+        """Get default channel"""
+        settings = self.user_settings.find_one({'user_id': user_id})
+        return settings.get('default_channel') if settings else None
+    
+    def get_default_group(self, user_id: int):
+        """Get default group"""
+        settings = self.user_settings.find_one({'user_id': user_id})
+        return settings.get('default_group') if settings else None
+    
+    def clear_default_channel(self, user_id: int):
+        """Clear default channel"""
+        self.user_settings.update_one(
+            {'user_id': user_id},
+            {'$unset': {'default_channel': ''}}
+        )
+    
+    def clear_default_group(self, user_id: int):
+        """Clear default group"""
+        self.user_settings.update_one(
+            {'user_id': user_id},
+            {'$unset': {'default_group': ''}}
+        )
 
-db = MongoDB()
+# Global instance
+db = Database()
