@@ -1,7 +1,8 @@
-python-telegram-bot
-google-genai
-pdf2image
-Pillow
-pymongo
-reportlab
-weasyprint
+python-telegram-bot==20.7
+google-genai==0.3.0
+pdf2image==1.17.0
+Pillow==10.2.0
+pymongo==4.6.1
+reportlab==4.1.0
+weasyprint==62.3
+requests==2.31.0

@@ -1,167 +1,194 @@
 """
-Quiz Poster - WITH CANCELLATION & "?/total" COUNTER
-Posts quizzes and sends "?/200" counter to destination
-? = placeholder for student score
+Quiz poster — sends Telegram quiz polls to a channel or group.
+Features:
+- 2-attempt retry per question with reason logging
+- Progress callback
+- Batch rate-limiting
+- Header message support
 """
 
 import asyncio
-from typing import List, Dict, Optional
-from telegram.ext import ContextTypes
-from telegram.error import RetryAfter, TimedOut
+import logging
+from typing import List, Dict, Optional, Callable
+from telegram.error import RetryAfter, TimedOut, BadRequest, Forbidden
 from config import config
 
+logger = logging.getLogger(__name__)
+
+OPTION_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+MAX_QUESTION_LEN = 300
+MAX_EXPLANATION_LEN = 200
+
+
 class QuizPoster:
-    def __init__(self):
-        self.active_postings = {}  # {user_id: {'cancel': bool}}
-        print("✅ Quiz Poster initialized")
-    
+    # ── Formatters ────────────────────────────────────────────────────────────
+
     @staticmethod
     def format_question(text: str, marker: str) -> str:
-        """Format question with marker"""
-        formatted = f"{marker}\n\n{text}"
-        if len(formatted) > 300:
-            formatted = f"{marker}\n\n{text[:300-len(marker)-6]}..."
-        return formatted
-    
+        prefix = f"{marker}\n\n" if marker else ""
+        full = f"{prefix}{text}"
+        if len(full) > MAX_QUESTION_LEN:
+            max_body = MAX_QUESTION_LEN - len(prefix) - 3
+            full = f"{prefix}{text[:max_body]}..."
+        return full
+
     @staticmethod
-    def format_explanation(explanation: str, tag: str) -> str:
-        """Format explanation with tag"""
-        if not explanation:
+    def format_explanation(text: str, tag: str) -> Optional[str]:
+        if not text:
             return None
-        formatted = f"{explanation} [{tag}]"
-        if len(formatted) > 200:
-            formatted = f"{explanation[:200-len(tag)-7]}... [{tag}]"
-        return formatted
-    
+        suffix = f" [{tag}]" if tag else ""
+        full = f"{text}{suffix}"
+        if len(full) > MAX_EXPLANATION_LEN:
+            max_body = MAX_EXPLANATION_LEN - len(suffix) - 3
+            full = f"{text[:max_body]}...{suffix}"
+        return full
+
+    # ── Single quiz sender ────────────────────────────────────────────────────
+
     @staticmethod
-    async def send_quiz_with_retry(context, chat_id, question, marker, tag, thread_id=None, max_retries=3):
-        """Send single quiz with retry logic"""
+    async def send_quiz_with_retry(
+        context,
+        chat_id: int,
+        question: Dict,
+        quiz_marker: str,
+        explanation_tag: str,
+        message_thread_id: Optional[int] = None,
+        max_retries: int = 2,
+    ) -> Dict:
+        """
+        Returns dict: {"success": bool, "reason": str}
+        """
+        options = (question.get("options") or [])[:10]
+        if len(options) < 2:
+            return {"success": False, "reason": "fewer than 2 options"}
+
+        correct_id = question.get("correct_answer_index", 0)
+        if not isinstance(correct_id, int) or correct_id < 0 or correct_id >= len(options):
+            correct_id = 0
+
+        formatted_q = QuizPoster.format_question(
+            question.get("question_description") or "", quiz_marker
+        )
+        formatted_e = QuizPoster.format_explanation(
+            question.get("explanation") or "", explanation_tag
+        )
+
+        last_reason = "unknown error"
         for attempt in range(max_retries):
             try:
-                opts = question.get('options', [])[:10]
-                if len(opts) < 2:
-                    return False
-                
-                correct_id = max(0, min(question.get('correct_answer_index', 0), len(opts) - 1))
-                q = QuizPoster.format_question(question.get('question_description', ''), marker)
-                e = QuizPoster.format_explanation(question.get('explanation', ''), tag)
-                
                 await context.bot.send_poll(
                     chat_id=chat_id,
-                    question=q,
-                    options=opts,
-                    type='quiz',
+                    question=formatted_q,
+                    options=options,
+                    type="quiz",
                     correct_option_id=correct_id,
-                    explanation=e,
+                    explanation=formatted_e,
                     is_anonymous=True,
-                    message_thread_id=thread_id
+                    message_thread_id=message_thread_id,
                 )
-                return True
-            except (RetryAfter, TimedOut):
+                return {"success": True, "reason": ""}
+
+            except RetryAfter as e:
+                wait = e.retry_after + 1
+                logger.warning(f"Rate limited — waiting {wait}s (attempt {attempt+1})")
+                await asyncio.sleep(wait)
+                last_reason = f"rate limited ({e.retry_after}s)"
+
+            except TimedOut:
+                logger.warning(f"Timed out (attempt {attempt+1})")
                 await asyncio.sleep(2)
+                last_reason = "timed out"
+
+            except Forbidden as e:
+                logger.error(f"Forbidden: {e}")
+                return {"success": False, "reason": f"forbidden: {e}"}
+
+            except BadRequest as e:
+                logger.error(f"BadRequest: {e}")
+                return {"success": False, "reason": f"bad request: {e}"}
+
             except Exception as e:
-                print(f"⚠️ Quiz send error: {e}")
-                return False
-        return False
-    
+                logger.error(f"Unexpected error (attempt {attempt+1}): {e}")
+                await asyncio.sleep(1)
+                last_reason = str(e)
+
+        return {"success": False, "reason": last_reason}
+
+    # ── Batch poster ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def post_header(context, chat_id: int, header: str, thread_id: Optional[int] = None):
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=header,
+                message_thread_id=thread_id,
+            )
+        except Exception as e:
+            logger.warning(f"Header send failed: {e}")
+
+    @staticmethod
     async def post_quizzes_batch(
-        self,
         context,
-        chat_id,
-        questions,
-        marker,
-        tag,
-        thread_id=None,
-        progress_callback=None,
-        custom_message=None,
-        user_id=None
-    ):
-        """
-        Post quizzes with custom message
-        Sends "?/total" counter to destination
-        """
+        chat_id: int,
+        questions: List[Dict],
+        quiz_marker: str,
+        explanation_tag: str,
+        message_thread_id: Optional[int] = None,
+        progress_callback: Optional[Callable] = None,
+        header: Optional[str] = None,
+    ) -> Dict:
         total = len(questions)
         success = failed = skipped = 0
-        
-        # Register posting session
-        if user_id:
-            self.active_postings[user_id] = {'cancel': False}
-        
-        # Custom message sent and pinned in content_processor
-        
-        # Post quizzes
+        failures: List[str] = []
+
+        # Send header first
+        if header:
+            await QuizPoster.post_header(context, chat_id, header, message_thread_id)
+            await asyncio.sleep(0.5)
+
         for i in range(0, total, config.BATCH_SIZE):
-            # Check cancellation
-            if user_id and self.active_postings.get(user_id, {}).get('cancel'):
-                print(f"🛑 Cancelled by user {user_id}")
-                break
-            
-            batch = questions[i:i + config.BATCH_SIZE]
-            
-            for idx, q in enumerate(batch):
-                # Check cancellation
-                if user_id and self.active_postings.get(user_id, {}).get('cancel'):
-                    break
-                
-                global_idx = i + idx + 1
-                
-                # Update progress
+            batch = questions[i: i + config.BATCH_SIZE]
+
+            for local_idx, q in enumerate(batch):
+                global_idx = i + local_idx + 1
+
                 if progress_callback:
-                    await progress_callback(global_idx, total, success, failed)
-                
-                # Validate
-                if not q.get('question_description') or not q.get('options'):
+                    try:
+                        await progress_callback(global_idx, total)
+                    except Exception:
+                        pass
+
+                if not (q.get("question_description") or "").strip():
                     skipped += 1
+                    logger.warning(f"Q{global_idx}: empty question — skipped")
                     continue
-                
-                # Send quiz
-                if await self.send_quiz_with_retry(context, chat_id, q, marker, tag, thread_id):
+                if not q.get("options"):
+                    skipped += 1
+                    logger.warning(f"Q{global_idx}: no options — skipped")
+                    continue
+
+                result = await QuizPoster.send_quiz_with_retry(
+                    context, chat_id, q, quiz_marker, explanation_tag, message_thread_id
+                )
+                if result["success"]:
                     success += 1
                 else:
                     failed += 1
-                
-                # Delay
+                    failures.append(f"Q{global_idx}: {result['reason']}")
+                    logger.warning(f"Q{global_idx} failed: {result['reason']}")
+
                 if global_idx < total:
                     await asyncio.sleep(config.POLL_DELAY)
-            
-            # Check cancellation before batch delay
-            if user_id and self.active_postings.get(user_id, {}).get('cancel'):
-                break
-            
-            # Batch delay
+
+            # Inter-batch pause
             if i + config.BATCH_SIZE < total:
                 await asyncio.sleep(config.BATCH_DELAY)
-        
-        # ===== SEND COUNTER: ?/total =====
-        try:
-            counter_message = f"?/{total}"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=counter_message,
-                message_thread_id=thread_id
-            )
-            print(f"✅ Sent counter: {counter_message}")
-        except Exception as e:
-            print(f"⚠️ Could not send counter: {e}")
-        
-        # Cleanup
-        if user_id and user_id in self.active_postings:
-            del self.active_postings[user_id]
-        
-        return {
-            'total': total,
-            'success': success,
-            'failed': failed,
-            'skipped': skipped
-        }
-    
-    def cancel_posting(self, user_id: int):
-        """Cancel active posting"""
-        if user_id in self.active_postings:
-            self.active_postings[user_id]['cancel'] = True
-            print(f"🛑 Marked for cancellation: user {user_id}")
-            return True
-        return False
 
-# Global instance
-quiz_poster = QuizPoster()
+        return {
+            "total": total,
+            "success": success,
+            "failed": failed,
+            "skipped": skipped,
+            "failures": failures,
+        }

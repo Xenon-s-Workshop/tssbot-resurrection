@@ -1,5 +1,9 @@
+.env
 __pycache__/
 *.pyc
+*.pyo
 temp/
 output/
-.env
+*.log
+.DS_Store
+fonts/*.ttf

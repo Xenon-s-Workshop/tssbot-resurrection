@@ -1,87 +1,142 @@
-# TSS Bot - Complete Fixed Version
+# 🤖 Telegram Quiz Bot — Fixed & Upgraded
 
-## All Issues Fixed
+A production-ready Telegram bot that extracts or generates MCQs from PDFs and images using **Gemini AI**, exports them as CSV / JSON / PDF, and posts them as Telegram quiz polls.
 
-### ✅ 1. Progress Bars Added
-- PDF generation shows percentage progress
-- Poll posting shows "Posting X/Y quizzes..."
-- Image processing shows "Processing page X/Y"
-- Live updates during all operations
+---
 
-### ✅ 2. Bengali Font Support Fixed
-- Uses DejaVuSans font for Unicode support
-- Properly handles Bengali characters in PDF
-- No distortion in questions/options/explanations
+## ✨ What's Fixed
 
-### ✅ 3. Poll Collector Completely Fixed
-- Rewritten based on proper state management
-- Auto-delete works correctly
-- Live counter updates properly
-- Export to CSV/PDF works
+| Issue | Fix Applied |
+|---|---|
+| `KeyError: 'quiz_marker'` | All settings access uses `.get()` with defaults; DB back-fills missing keys |
+| Empty CSV fields | Full validation per row; skips invalid rows with warnings |
+| Missing JSON export | Added alongside CSV |
+| Broken PDF | Rebuilt with ReportLab (2 modes) + WeasyPrint fallback |
+| Bengali font crash | Noto Sans Bengali auto-downloaded and registered for both engines |
+| Post flow chaos | 3-step flow: header → destination → progress bar |
+| Duplicate clicks | UI disabled immediately after destination selected |
+| `/collectpolls` | Stores poll answers, exports as JSON |
+| No global error handler | Added — logs and notifies user |
+| Vague UX messages | Live progress bars, descriptive status at every step |
 
-### ✅ 4. Page Range Selection Added
-- After receiving PDF, bot asks for page range
-- Options: "All Pages" or "Enter range (e.g., 1-10)"
-- Processes only selected pages
+---
 
-### ✅ 5. Detailed Progress for Poll Posting
-- Shows "📊 Posting quiz X of Y..."
-- Updates every quiz
-- Shows final summary (Success/Failed/Total)
+## 🚀 Setup
 
-### ✅ 6. PDF Formats Simplified (2 Clear Formats)
-**Format 1: Standard**
-- Clean, readable layout
-- Questions with options
-- Answers marked
-- ~10 questions/page
-
-**Format 2: Detailed**  
-- Includes explanations
-- Color-coded answers
-- More spacing
-- ~6 questions/page
-
-### ✅ 7. Ghost Bug Fixed
-- Proper task cleanup after completion
-- No false "task ongoing" messages
-- Force cleanup on cancel
-- Timeout handling (5 min auto-clear)
-
-### ✅ 8. Queue System Fixed
-- Proper state management
-- Correct position tracking
-- Clean task removal
-- No stuck tasks
-
-## Installation
-
+### 1. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-## Environment Variables
-
+### 2. Configure environment
 ```bash
-TELEGRAM_BOT_TOKEN=your_token
-GEMINI_API_KEYS=key1,key2,key3
-MONGODB_URI=mongodb://localhost:27017/
-SUDO_USER_IDS=123456789
-AUTH_ENABLED=true
+cp .env.example .env
+# Edit .env with your tokens
 ```
 
-## Usage
+### 3. Font (optional — auto-downloads on first run)
+Place `NotoSansBengali-Regular.ttf` in the `fonts/` folder, or the bot will download it automatically.
 
+### 4. Run
 ```bash
 python main.py
 ```
 
-## Key Features
+---
 
-- ✅ Progress bars everywhere
-- ✅ Bengali font support
-- ✅ Working poll collection
-- ✅ Page range selection
-- ✅ 2 clear PDF formats
-- ✅ No ghost bugs
-- ✅ Working queue system
+## ⚙️ Configuration
+
+All settings are editable via `/settings` in the bot. They persist per user in MongoDB.
+
+| Setting | Default | Description |
+|---|---|---|
+| `quiz_marker` | `[TSS]` | Prepended to every quiz question |
+| `explanation_tag` | `t.me/tss` | Appended to every explanation |
+| `pdf_mode` | `inline` | `inline` or `answer_key` |
+
+Global defaults can be set via environment variables:
+```
+QUIZ_MARKER=[TSS]
+EXPLANATION_TAG=t.me/mychannel
+```
+
+---
+
+## 📄 PDF Modes
+
+### `inline` (default)
+Each question shows:
+- Question text
+- All options (correct one marked with ✓)
+- Explanation inline
+
+### `answer_key`
+- Part 1: All questions + options (no answers)
+- Part 2: Answer key (`1 → A`, `2 → C`, …) with explanations
+
+---
+
+## 📁 Project Structure
+
+```
+tssbot-fixed/
+├── main.py                     # Entry point, queue, error handler
+├── config.py                   # All configuration
+├── database.py                 # MongoDB (users, channels, groups, polls)
+├── requirements.txt
+├── .env.example
+├── bot/
+│   ├── handlers.py             # /start /help /settings + file handlers
+│   ├── callbacks.py            # All inline keyboard + text state machine
+│   └── content_processor.py   # PDF→AI→exports→post pipeline
+├── processors/
+│   ├── csv_processor.py        # CSV parse + write; JSON write
+│   ├── pdf_processor.py        # Gemini image processing
+│   ├── pdf_generator.py        # ReportLab + WeasyPrint PDF engines
+│   ├── quiz_poster.py          # Telegram poll posting with retry
+│   └── image_processor.py     # PIL image loader
+├── prompts/
+│   ├── extraction_prompt.py
+│   └── generation_prompt.py
+├── utils/
+│   ├── api_rotator.py          # Round-robin Gemini key rotation
+│   └── queue_manager.py        # Per-user task queue
+└── fonts/
+    └── NotoSansBengali-Regular.ttf  # Auto-downloaded on first run
+```
+
+---
+
+## 📋 CSV Format (for import)
+
+```
+question,option_a,option_b,option_c,option_d,correct_answer,explanation
+What is 2+2?,1,2,3,4,D,Simple arithmetic
+```
+
+The bot also accepts the **legacy format** (`questions`, `option1–4`, `answer` as number).
+
+---
+
+## 📢 Posting Flow
+
+1. Send PDF/image → choose mode → receive CSV + JSON + PDF
+2. Tap **Post Quizzes**
+3. **Step 1**: Send a header message (or skip)
+4. **Step 2**: Choose a channel or group
+5. **Step 3**: Bot posts with a live progress bar
+
+---
+
+## 🔧 Commands
+
+| Command | Description |
+|---|---|
+| `/start` | Main menu with action buttons |
+| `/help` | Full step-by-step guide |
+| `/settings` | Configure channels, markers, PDF mode |
+| `/info` | Show current chat ID (useful for adding groups) |
+| `/queue` | Check your queue position |
+| `/cancel` | Cancel current task and reset session |
+| `/collectpolls` | View and export collected poll answers |
+| `/model` | Show AI model and worker info |

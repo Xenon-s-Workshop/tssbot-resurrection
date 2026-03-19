@@ -1,158 +1,187 @@
-"""
-Database Module - MongoDB Integration
-Handles user authorization, channels, groups, and settings
-WITH DEFAULT DESTINATION SUPPORT
-"""
-
+import os
+import logging
+from typing import Dict, List
+from datetime import datetime
 from pymongo import MongoClient
+from bson import ObjectId
 from config import config
 
-class Database:
+logger = logging.getLogger(__name__)
+
+
+class MongoDB:
     def __init__(self):
         self.client = MongoClient(config.MONGODB_URI)
-        self.db = self.client['tss_bot']
-        
-        # Initialize collections
-        self.users = self.db.users
-        self.channels = self.db.channels
-        self.groups = self.db.groups
-        self.user_settings = self.db.user_settings
-        
-        print("✅ MongoDB connected")
-        
-        # Initialize sudo users
-        for user_id in config.SUDO_USER_IDS:
-            self.authorize_user(user_id)
-        print(f"✅ {len(config.SUDO_USER_IDS)} sudo users initialized")
-    
-    # ==================== USER AUTHORIZATION ====================
-    
-    def is_user_authorized(self, user_id: int) -> bool:
-        """Check if user is authorized"""
-        if not config.AUTH_ENABLED:
-            return True
-        return self.users.find_one({'user_id': user_id}) is not None
-    
-    def authorize_user(self, user_id: int):
-        """Authorize a user"""
-        self.users.update_one(
-            {'user_id': user_id},
-            {'$set': {'user_id': user_id, 'authorized': True}},
-            upsert=True
-        )
-    
-    def revoke_user(self, user_id: int):
-        """Revoke user authorization"""
-        self.users.delete_one({'user_id': user_id})
-    
-    def get_authorized_users(self):
-        """Get all authorized users"""
-        return list(self.users.find())
-    
-    # ==================== CHANNELS ====================
-    
-    def add_channel(self, user_id: int, channel_id: int, channel_name: str):
-        """Add a channel"""
-        self.channels.insert_one({
-            'user_id': user_id,
-            'channel_id': channel_id,
-            'channel_name': channel_name
-        })
-    
-    def get_user_channels(self, user_id: int):
-        """Get user's channels"""
-        return list(self.channels.find({'user_id': user_id}))
-    
-    def delete_channel(self, channel_id: str):
-        """Delete a channel by MongoDB _id"""
-        from bson.objectid import ObjectId
-        self.channels.delete_one({'_id': ObjectId(channel_id)})
-    
-    # ==================== GROUPS ====================
-    
-    def add_group(self, user_id: int, group_id: int, group_name: str):
-        """Add a group"""
-        self.groups.insert_one({
-            'user_id': user_id,
-            'group_id': group_id,
-            'group_name': group_name
-        })
-    
-    def get_user_groups(self, user_id: int):
-        """Get user's groups"""
-        return list(self.groups.find({'user_id': user_id}))
-    
-    def delete_group(self, group_id: str):
-        """Delete a group by MongoDB _id"""
-        from bson.objectid import ObjectId
-        self.groups.delete_one({'_id': ObjectId(group_id)})
-    
-    # ==================== USER SETTINGS ====================
-    
-    def get_user_settings(self, user_id: int) -> dict:
-        """Get user settings"""
-        settings = self.user_settings.find_one({'user_id': user_id})
-        
-        if not settings:
-            # Create default settings
-            settings = {
-                'user_id': user_id,
-                'quiz_marker': '🎯',
-                'explanation_tag': 'Exp'
+        self.db = self.client["telegram_quiz_bot"]
+        self.users = self.db["users"]
+        self.channels = self.db["channels"]
+        self.groups = self.db["groups"]
+        self.polls = self.db["polls"]
+        self.auth_users = self.db["auth_users"]
+        logger.info("✅ MongoDB connected")
+
+    # ── User Settings ────────────────────────────────────────────────────────
+
+    def get_user_settings(self, user_id: int) -> Dict:
+        user = self.users.find_one({"user_id": user_id})
+        if not user:
+            default_settings = {
+                "user_id": user_id,
+                "quiz_marker": config.DEFAULT_QUIZ_MARKER,
+                "explanation_tag": config.DEFAULT_EXPLANATION_TAG,
+                "pdf_mode": config.DEFAULT_PDF_MODE,
+                "created_at": datetime.now(),
             }
-            self.user_settings.insert_one(settings)
-        
-        return settings
-    
-    def update_user_settings(self, user_id: int, settings: dict):
-        """Update user settings"""
-        self.user_settings.update_one(
-            {'user_id': user_id},
-            {'$set': settings},
-            upsert=True
-        )
-    
-    # ==================== DEFAULT DESTINATIONS ====================
-    
-    def set_default_channel(self, user_id: int, channel_id: int):
-        """Set default channel for user"""
-        self.user_settings.update_one(
-            {'user_id': user_id},
-            {'$set': {'default_channel': channel_id}},
-            upsert=True
-        )
-    
-    def set_default_group(self, user_id: int, group_id: int):
-        """Set default group for user"""
-        self.user_settings.update_one(
-            {'user_id': user_id},
-            {'$set': {'default_group': group_id}},
-            upsert=True
-        )
-    
-    def get_default_channel(self, user_id: int):
-        """Get default channel"""
-        settings = self.user_settings.find_one({'user_id': user_id})
-        return settings.get('default_channel') if settings else None
-    
-    def get_default_group(self, user_id: int):
-        """Get default group"""
-        settings = self.user_settings.find_one({'user_id': user_id})
-        return settings.get('default_group') if settings else None
-    
-    def clear_default_channel(self, user_id: int):
-        """Clear default channel"""
-        self.user_settings.update_one(
-            {'user_id': user_id},
-            {'$unset': {'default_channel': ''}}
-        )
-    
-    def clear_default_group(self, user_id: int):
-        """Clear default group"""
-        self.user_settings.update_one(
-            {'user_id': user_id},
-            {'$unset': {'default_group': ''}}
+            self.users.insert_one(default_settings)
+            return default_settings
+
+        # Back-fill any keys added after initial creation
+        updated = False
+        defaults = {
+            "quiz_marker": config.DEFAULT_QUIZ_MARKER,
+            "explanation_tag": config.DEFAULT_EXPLANATION_TAG,
+            "pdf_mode": config.DEFAULT_PDF_MODE,
+        }
+        for key, val in defaults.items():
+            if key not in user:
+                user[key] = val
+                updated = True
+        if updated:
+            self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {k: v for k, v in defaults.items() if k not in user}},
+            )
+        return user
+
+    def update_user_settings(self, user_id: int, key: str, value: str):
+        self.users.update_one(
+            {"user_id": user_id},
+            {"$set": {key: value, "updated_at": datetime.now()}},
+            upsert=True,
         )
 
-# Global instance
-db = Database()
+    # ── Channels / Groups ────────────────────────────────────────────────────
+
+    def add_channel(self, user_id: int, channel_id: int, channel_name: str):
+        existing = self.channels.find_one({"user_id": user_id, "channel_id": channel_id})
+        if existing:
+            self.channels.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"channel_name": channel_name, "updated_at": datetime.now()}},
+            )
+        else:
+            self.channels.insert_one(
+                {
+                    "user_id": user_id,
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "type": "channel",
+                    "created_at": datetime.now(),
+                }
+            )
+
+    def add_group(self, user_id: int, group_id: int, group_name: str):
+        existing = self.groups.find_one({"user_id": user_id, "group_id": group_id})
+        if existing:
+            self.groups.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"group_name": group_name, "updated_at": datetime.now()}},
+            )
+        else:
+            self.groups.insert_one(
+                {
+                    "user_id": user_id,
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "type": "group",
+                    "created_at": datetime.now(),
+                }
+            )
+
+    def get_user_channels(self, user_id: int) -> List[Dict]:
+        return list(self.channels.find({"user_id": user_id}))
+
+    def get_user_groups(self, user_id: int) -> List[Dict]:
+        return list(self.groups.find({"user_id": user_id}))
+
+    def delete_channel(self, channel_doc_id: str):
+        self.channels.delete_one({"_id": ObjectId(channel_doc_id)})
+
+    def delete_group(self, group_doc_id: str):
+        self.groups.delete_one({"_id": ObjectId(group_doc_id)})
+
+
+    # ── Authorization ────────────────────────────────────────────────────────
+
+    def is_user_authorized(self, user_id: int) -> bool:
+        """Return True if user_id is allowed to use the bot.
+        Owner (from env) is always authorized.
+        If PUBLIC_ACCESS env is 'true', everyone is authorized.
+        Otherwise checks auth_users collection.
+        """
+        import os
+        if os.getenv("PUBLIC_ACCESS", "false").lower() == "true":
+            return True
+        owner_id_str = os.getenv("OWNER_ID", "")
+        if owner_id_str:
+            try:
+                if user_id == int(owner_id_str):
+                    return True
+            except ValueError:
+                pass
+        doc = self.auth_users.find_one({"user_id": user_id})
+        return doc is not None
+
+    def add_authorized_user(self, user_id: int, added_by: int = None, role: str = "user"):
+        """Add or update a user in the auth list."""
+        self.auth_users.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "role": role,
+                    "added_by": added_by,
+                    "updated_at": datetime.now(),
+                },
+                "$setOnInsert": {"created_at": datetime.now()},
+            },
+            upsert=True,
+        )
+        logger.info(f"Auth: user {user_id} added with role={role} by {added_by}")
+
+    def remove_authorized_user(self, user_id: int) -> bool:
+        """Remove a user from the auth list. Returns True if deleted."""
+        result = self.auth_users.delete_one({"user_id": user_id})
+        removed = result.deleted_count > 0
+        if removed:
+            logger.info(f"Auth: user {user_id} removed")
+        return removed
+
+    def list_authorized_users(self) -> List[Dict]:
+        """Return all authorized users."""
+        return list(self.auth_users.find({}, {"_id": 0}))
+
+    # ── Poll Collection ──────────────────────────────────────────────────────
+
+    def store_poll(self, user_id: int, poll_id: str, poll_data: Dict):
+        self.polls.update_one(
+            {"poll_id": poll_id},
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "poll_id": poll_id,
+                    "data": poll_data,
+                    "updated_at": datetime.now(),
+                }
+            },
+            upsert=True,
+        )
+
+    def get_user_polls(self, user_id: int) -> List[Dict]:
+        return list(self.polls.find({"user_id": user_id}))
+
+    def clear_user_polls(self, user_id: int):
+        self.polls.delete_many({"user_id": user_id})
+
+
+db = MongoDB()

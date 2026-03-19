@@ -18,20 +18,20 @@ def require_auth(func):
         # Find Update and context objects
         update = None
         context = None
-        
+
         for arg in args:
             if isinstance(arg, Update):
                 update = arg
             elif hasattr(arg, 'bot') and hasattr(arg, 'user_data'):
                 context = arg
-        
+
         # If no update found, allow (internal call)
         if not update:
             return await func(*args, **kwargs)
-        
+
         # Get user_id
         user_id = None
-        
+
         # Try effective_user first
         if hasattr(update, 'effective_user') and update.effective_user:
             user_id = update.effective_user.id
@@ -42,13 +42,13 @@ def require_auth(func):
             else:
                 # Anonymous poll answer or channel
                 return None
-        
+
         # No user_id means anonymous/channel update
         if user_id is None:
             return None
-        
+
         # Check authorization - USE CORRECT METHOD NAME
-        if not db.is_user_authorized(user_id):  # ← FIXED: was is_authorized
+        if not db.is_user_authorized(user_id):  # <- FIXED: was is_authorized
             # Send unauthorized message if context available
             if context and hasattr(update, 'message') and update.message:
                 await update.message.reply_text(
@@ -56,8 +56,8 @@ def require_auth(func):
                     "Contact admin for access."
                 )
             return None
-        
+
         # User is authorized, execute function
         return await func(*args, **kwargs)
-    
+
     return wrapper
