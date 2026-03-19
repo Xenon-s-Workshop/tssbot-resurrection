@@ -1,6 +1,7 @@
 """
-Quiz Poster - WITH CANCELLATION & CORRECT COUNTER FORMAT
+Quiz Poster - WITH CANCELLATION & "?/total" COUNTER
 Posts quizzes and sends "?/200" counter to destination
+? = placeholder for student score
 """
 
 import asyncio
@@ -77,7 +78,7 @@ class QuizPoster:
     ):
         """
         Post quizzes with custom message
-        Sends "?/total" counter to destination (e.g., "145/200")
+        Sends "?/total" counter to destination
         """
         total = len(questions)
         success = failed = skipped = 0
@@ -86,22 +87,20 @@ class QuizPoster:
         if user_id:
             self.active_postings[user_id] = {'cancel': False}
         
-        # Custom message is now sent and pinned in content_processor
-        # Don't send it again here
+        # Custom message sent and pinned in content_processor
         
         # Post quizzes
         for i in range(0, total, config.BATCH_SIZE):
-            # Check for cancellation
+            # Check cancellation
             if user_id and self.active_postings.get(user_id, {}).get('cancel'):
-                print(f"🛑 Posting cancelled by user {user_id}")
+                print(f"🛑 Cancelled by user {user_id}")
                 break
             
             batch = questions[i:i + config.BATCH_SIZE]
             
             for idx, q in enumerate(batch):
-                # Check cancellation again
+                # Check cancellation
                 if user_id and self.active_postings.get(user_id, {}).get('cancel'):
-                    print(f"🛑 Posting cancelled by user {user_id}")
                     break
                 
                 global_idx = i + idx + 1
@@ -110,7 +109,7 @@ class QuizPoster:
                 if progress_callback:
                     await progress_callback(global_idx, total, success, failed)
                 
-                # Validate question
+                # Validate
                 if not q.get('question_description') or not q.get('options'):
                     skipped += 1
                     continue
@@ -121,32 +120,31 @@ class QuizPoster:
                 else:
                     failed += 1
                 
-                # Delay between quizzes
+                # Delay
                 if global_idx < total:
                     await asyncio.sleep(config.POLL_DELAY)
             
-            # Check if cancelled before batch delay
+            # Check cancellation before batch delay
             if user_id and self.active_postings.get(user_id, {}).get('cancel'):
                 break
             
-            # Delay between batches
+            # Batch delay
             if i + config.BATCH_SIZE < total:
                 await asyncio.sleep(config.BATCH_DELAY)
         
-        # ===== SEND COUNTER IN FORMAT: ?/total =====
-        # Example: "145/200" means 145 quizzes sent successfully out of 200 total
+        # ===== SEND COUNTER: ?/total =====
         try:
-            counter_message = f"{success}/{total}"
+            counter_message = f"?/{total}"
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=counter_message,
                 message_thread_id=thread_id
             )
-            print(f"✅ Sent counter to destination: {counter_message}")
+            print(f"✅ Sent counter: {counter_message}")
         except Exception as e:
             print(f"⚠️ Could not send counter: {e}")
         
-        # Cleanup posting session
+        # Cleanup
         if user_id and user_id in self.active_postings:
             del self.active_postings[user_id]
         
@@ -158,13 +156,12 @@ class QuizPoster:
         }
     
     def cancel_posting(self, user_id: int):
-        """Cancel active posting for user"""
+        """Cancel active posting"""
         if user_id in self.active_postings:
             self.active_postings[user_id]['cancel'] = True
-            print(f"🛑 Marked posting for user {user_id} for cancellation")
+            print(f"🛑 Marked for cancellation: user {user_id}")
             return True
         return False
 
-
-# ===== GLOBAL INSTANCE - MUST BE AT END OF FILE =====
+# Global instance
 quiz_poster = QuizPoster()
