@@ -1,6 +1,6 @@
 """
-Content Processor - FIXED CSV Export
-Proper validation and error handling
+Content Processor - Complete with Grid PDF Modes
+Auto-generates CSV, JSON, and 2 Grid-Layout PDFs
 """
 
 import json
@@ -28,8 +28,7 @@ class ContentProcessor:
             if content_type == 'pdf':
                 msg = await context.bot.send_message(
                     user_id,
-                    f"🔄 **Processing PDF**
-"
+                    f"🔄 **Processing PDF**\n"
                     f"Model: `{config.GEMINI_MODEL}`",
                     parse_mode='Markdown'
                 )
@@ -38,9 +37,7 @@ class ContentProcessor:
                     images = await PDFProcessor.pdf_to_images(content_paths[0], page_range)
                 except Exception as e:
                     await msg.edit_text(
-                        f"❌ **PDF Conversion Failed**
-
-`{str(e)[:150]}`",
+                        f"❌ **PDF Conversion Failed**\n\n`{str(e)[:150]}`",
                         parse_mode='Markdown'
                     )
                     return
@@ -54,8 +51,7 @@ class ContentProcessor:
                 await msg.edit_text("❌ No images found")
                 return
 
-            await msg.edit_text(f"✅ {total} images
-⚙️ **Processing with AI...**")
+            await msg.edit_text(f"✅ {total} images\n⚙️ **Processing with AI...**")
 
             # Progress callback
             async def progress(current, total_pages):
@@ -63,8 +59,7 @@ class ContentProcessor:
                     pct = int((current / total_pages) * 100)
                     bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                     await msg.edit_text(
-                        f"`[{bar}]` {pct}%
-{current}/{total_pages}",
+                        f"`[{bar}]` {pct}%\n{current}/{total_pages}",
                         parse_mode='Markdown'
                     )
                 except:
@@ -81,9 +76,7 @@ class ContentProcessor:
                 )
             except Exception as e:
                 await msg.edit_text(
-                    f"❌ **Processing Failed**
-
-`{str(e)[:150]}`",
+                    f"❌ **Processing Failed**\n\n`{str(e)[:150]}`",
                     parse_mode='Markdown'
                 )
                 raise
@@ -101,9 +94,7 @@ class ContentProcessor:
                     return
             except Exception as e:
                 await msg.edit_text(
-                    f"❌ **Format Error**
-
-`{str(e)[:150]}`",
+                    f"❌ **Format Error**\n\n`{str(e)[:150]}`",
                     parse_mode='Markdown'
                 )
                 return
@@ -119,8 +110,7 @@ class ContentProcessor:
             }
 
             await msg.edit_text(
-                f"✅ **{len(questions)} Questions**
-"
+                f"✅ **{len(questions)} Questions**\n"
                 f"📦 Generating files..."
             )
 
@@ -139,9 +129,7 @@ class ContentProcessor:
             
             if msg:
                 await msg.edit_text(
-                    f"❌ **Error**
-
-`{str(e)[:150]}`",
+                    f"❌ **Error**\n\n`{str(e)[:150]}`",
                     parse_mode='Markdown'
                 )
             raise
@@ -263,7 +251,7 @@ class ContentProcessor:
         return normalized
 
     async def auto_generate_files(self, user_id: int, questions: List, timestamp: str, context, progress_msg):
-        """Generate CSV, JSON, PDF - WITH VALIDATION"""
+        """Generate CSV, JSON, and 2 Grid-Layout PDFs"""
         
         try:
             # CSV with validation
@@ -274,7 +262,6 @@ class ContentProcessor:
             csv_questions = []
             for idx, q in enumerate(questions, 1):
                 try:
-                    # Validate before adding
                     question_text = q.get('question_description', '').strip()
                     options = q.get('options', [])
                     
@@ -313,8 +300,7 @@ class ContentProcessor:
             print(f"✅ CSV: {len(csv_questions)} questions")
             
             # JSON
-            await progress_msg.edit_text("📦 CSV ✓
-📦 **Generating JSON...**")
+            await progress_msg.edit_text("📦 CSV ✓\n📦 **Generating JSON...**")
             
             json_questions = []
             for q in questions:
@@ -335,21 +321,21 @@ class ContentProcessor:
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(json_questions, f, ensure_ascii=False, indent=2)
             
-            # PDF
-            await progress_msg.edit_text("📦 CSV ✓
-📦 JSON ✓
-📦 **Generating PDF...**")
+            # PDF - BOTH GRID MODES
+            await progress_msg.edit_text("📦 CSV ✓\n📦 JSON ✓\n📦 **Generating PDFs...**")
             
             from processors.pdf_exporter import pdf_exporter
             
-            settings = db.get_user_settings(user_id)
-            pdf_mode = settings.get('pdf_mode', 'mode1')
-            
             pdf_title = f"Quiz_{timestamp}"
-            pdf_path = config.OUTPUT_DIR / f"questions_{timestamp}.pdf"
             
+            # Mode 1: Grid with answer boxes
+            pdf_path_mode1 = config.OUTPUT_DIR / f"questions_{timestamp}_mode1.pdf"
             cleaned = pdf_exporter.cleanup_questions(questions)
-            pdf_exporter.generate_beautiful_pdf(cleaned, pdf_path, pdf_title, mode=pdf_mode)
+            pdf_exporter.generate_beautiful_pdf(cleaned, pdf_path_mode1, pdf_title, mode='mode1')
+            
+            # Mode 2: Grid with highlighted answers
+            pdf_path_mode2 = config.OUTPUT_DIR / f"questions_{timestamp}_mode2.pdf"
+            pdf_exporter.generate_beautiful_pdf(cleaned, pdf_path_mode2, pdf_title, mode='mode2')
             
             # Send files
             await progress_msg.edit_text("📦 **Sending files...**")
@@ -370,7 +356,23 @@ class ContentProcessor:
                     caption="📋 **JSON File**"
                 )
             
-            # PDF with action buttons
+            # PDF Mode 1
+            with open(pdf_path_mode1, 'rb') as f:
+                await context.bot.send_document(
+                    user_id, f,
+                    filename=f"{pdf_title}_GridAnswers.pdf",
+                    caption=f"📄 **PDF Mode 1** • Grid with Answer Boxes • {len(questions)}Q"
+                )
+            
+            # PDF Mode 2
+            with open(pdf_path_mode2, 'rb') as f:
+                await context.bot.send_document(
+                    user_id, f,
+                    filename=f"{pdf_title}_GridHighlighted.pdf",
+                    caption=f"📝 **PDF Mode 2** • Grid with Highlighted Answers • {len(questions)}Q"
+                )
+            
+            # Action buttons
             session_id = self.bot_handlers.user_states[user_id]['session_id']
             
             keyboard = [
@@ -378,18 +380,23 @@ class ContentProcessor:
                 [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")]
             ]
             
-            with open(pdf_path, 'rb') as f:
-                await context.bot.send_document(
-                    user_id, f,
-                    filename=f"questions_{timestamp}.pdf",
-                    caption=f"📄 **PDF File** • {len(questions)}Q • {pdf_mode}",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
+            await context.bot.send_message(
+                user_id,
+                f"✅ **All Files Generated**\n\n"
+                f"• CSV: Questions data\n"
+                f"• JSON: Structured format\n"
+                f"• PDF Mode 1: Answer boxes\n"
+                f"• PDF Mode 2: Highlighted answers\n\n"
+                f"Choose action:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
             
             # Cleanup
             csv_path.unlink(missing_ok=True)
             json_path.unlink(missing_ok=True)
-            pdf_path.unlink(missing_ok=True)
+            pdf_path_mode1.unlink(missing_ok=True)
+            pdf_path_mode2.unlink(missing_ok=True)
             
             # Delete progress message
             await progress_msg.delete()
@@ -402,9 +409,7 @@ class ContentProcessor:
             traceback.print_exc()
             
             await progress_msg.edit_text(
-                f"⚠️ **File Generation Error**
-
-`{str(e)[:150]}`",
+                f"⚠️ **File Generation Error**\n\n`{str(e)[:150]}`",
                 parse_mode='Markdown'
             )
 
@@ -418,8 +423,7 @@ class ContentProcessor:
         settings = db.get_user_settings(user_id)
 
         await status_msg.edit_text(
-            f"📢 **Starting...**
-{len(questions)} quizzes to post"
+            f"📢 **Starting...**\n{len(questions)} quizzes to post"
         )
 
         # Pin custom message if provided
@@ -448,13 +452,9 @@ class ContentProcessor:
                 pct = int((current / total) * 100)
                 bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 await status_msg.edit_text(
-                    f"📢 **Posting**
-
-"
-                    f"`[{bar}]` {pct}%
-"
-                    f"{current}/{total}
-"
+                    f"📢 **Posting**\n\n"
+                    f"`[{bar}]` {pct}%\n"
+                    f"{current}/{total}\n"
                     f"✅ {success} | ❌ {failed}",
                     parse_mode='Markdown'
                 )
@@ -471,24 +471,16 @@ class ContentProcessor:
 
         # Show results
         result_text = (
-            f"✅ **Complete**
-
-"
-            f"Total: {result['total']}
-"
-            f"Success: {result['success']}
-"
+            f"✅ **Complete**\n\n"
+            f"Total: {result['total']}\n"
+            f"Success: {result['success']}\n"
             f"Failed: {result['failed']}"
         )
         
         if result['failed_questions']:
-            result_text += "
-
-**Failed Questions:**
-"
+            result_text += "\n\n**Failed Questions:**\n"
             for fq in result['failed_questions'][:5]:
-                result_text += f"• Q{fq['number']}: {fq['error'][:30]}...
-"
+                result_text += f"• Q{fq['number']}: {fq['error'][:30]}...\n"
         
         await status_msg.edit_text(result_text, parse_mode='Markdown')
 
