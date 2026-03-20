@@ -1,6 +1,6 @@
 python-telegram-bot
 google-genai
-pdf2imag
+pdf2image
 Pillow
 pymongo
 selenium
