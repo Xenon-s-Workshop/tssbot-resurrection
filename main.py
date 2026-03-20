@@ -89,7 +89,9 @@ def main():
     # Store in bot_data for access by queue processor
     application.bot_data['bot_handlers'] = bot_handlers
     
-    # Command handlers
+    # ==================== COMMAND HANDLERS ====================
+    
+    # Basic commands
     application.add_handler(CommandHandler("start", bot_handlers.handle_start))
     application.add_handler(CommandHandler("help", bot_handlers.handle_help))
     application.add_handler(CommandHandler("settings", bot_handlers.handle_settings))
@@ -106,15 +108,28 @@ def main():
     
     # Poll collection commands
     application.add_handler(CommandHandler("collectpolls", bot_handlers.handle_collectpolls))
+    application.add_handler(CommandHandler("merge", bot_handlers.handle_merge))
     application.add_handler(CommandHandler("done", bot_handlers.handle_done))
     application.add_handler(CommandHandler("status", bot_handlers.handle_status))
     
-    # Message handlers
+    # ==================== MESSAGE HANDLERS ====================
+    
+    # Document handlers (PDF, CSV, JSON)
     application.add_handler(MessageHandler(filters.Document.PDF, bot_handlers.handle_document))
+    application.add_handler(MessageHandler(filters.Document.CSV, bot_handlers.handle_document))
+    application.add_handler(MessageHandler(filters.Document.FileExtension("json"), bot_handlers.handle_document))
     application.add_handler(MessageHandler(filters.Document.ALL, bot_handlers.handle_document))
+    
+    # Photo handler
     application.add_handler(MessageHandler(filters.PHOTO, bot_handlers.handle_photo))
+    
+    # Poll handler
     application.add_handler(MessageHandler(filters.POLL, bot_handlers.handle_poll))
+    
+    # Text handler (for callbacks)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, callback_handlers.handle_text))
+    
+    # ==================== OTHER HANDLERS ====================
     
     # Callback query handler
     application.add_handler(CallbackQueryHandler(callback_handlers.handle_callback))
@@ -125,15 +140,23 @@ def main():
     # Error handler
     application.add_error_handler(error_handler)
     
+    # ==================== POST INIT & JOBS ====================
+    
     # Post init
     application.post_init = post_init
     
     # Start queue processor
     application.job_queue.run_repeating(queue_processor, interval=3, first=1)
     
-    # Run bot
+    # ==================== RUN BOT ====================
+    
     logger.info("🚀 Starting TSS Bot...")
-    application.run_polling(drop_pending_updates=True)
+    logger.info(f"📊 Model: {config.GEMINI_MODEL}")
+    logger.info(f"🔑 API Keys: {len(config.GEMINI_API_KEYS)}")
+    logger.info(f"🔐 Auth: {'Enabled' if config.AUTH_ENABLED else 'Disabled'}")
+    logger.info(f"👥 Sudo Users: {len(config.SUDO_USER_IDS)}")
+    
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
