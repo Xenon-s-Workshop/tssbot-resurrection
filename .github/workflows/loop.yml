@@ -20,38 +20,40 @@ jobs:
         with:
           python-version: '3.11'
 
+      # ✅ System + PDF + Fonts + Rendering deps
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y poppler-utils libpoppler-cpp-dev
+          sudo apt-get install -y --fix-missing \
+            python3-cffi python3-brotli \
+            libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
+            libgdk-pixbuf2.0-0 libffi-dev shared-mime-info \
+            poppler-utils poppler-data \
+            fonts-dejavu-core fonts-noto fonts-noto-cjk fonts-noto-color-emoji fonts-liberation \
+            wget unzip xvfb
 
+          fc-cache -f -v
+          echo "✅ Fonts installed"
+
+      # ✅ Install Google Chrome
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      # ✅ Python deps
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Install Bengali/Unicode Fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --fix-missing \
-          python3-pip \
-          python3-cffi \
-          python3-brotli \
-          libpango-1.0-0 \
-          libpangoft2-1.0-0 \
-          libpangocairo-1.0-0 \
-          libgdk-pixbuf2.0-0 \
-          libffi-dev \
-          shared-mime-info \
-          poppler-utils \
-          poppler-data
-          sudo apt-get install -y fonts-dejavu-core fonts-noto fonts-liberation
-          fc-cache -f -v
-          echo "✅ Fonts installed"
-          fc-list | grep -i dejavu || echo "DejaVu fonts available"
 
-
+      # ✅ Run bot with virtual display
       - name: Run Telegram Bot
         env:
+          DISPLAY: :99
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_TOKEN }}
           GEMINI_API_KEYS: ${{ secrets.KEYS }}
           MONGODB_URI: ${{ secrets.URI }}
@@ -59,8 +61,14 @@ jobs:
           EXPLANATION_TAG: ${{ secrets.EXPLANATION_TAG }}
           SUDO_USER_IDS: ${{ secrets.IDS }}
         run: |
+          # Start virtual display
+          Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
+          sleep 3
+
+          # Run bot
           python main.py
 
+  # 🔁 Auto-restart loop
   looper:
     needs: mcq-extractor-bot
     runs-on: ubuntu-latest
@@ -76,7 +84,7 @@ jobs:
           git config --global user.email "${{ secrets.GITHUBMAIL }}"
           git config --global user.name "${{ secrets.GITHUBNAME }}"
       
-      - name: Commit empty change to trigger workflow
+      - name: Trigger restart
         run: |
           git commit --allow-empty -m "Auto-restart workflow"
           git push
