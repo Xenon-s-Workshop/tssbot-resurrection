@@ -114,20 +114,45 @@ def main():
     
     # ==================== MESSAGE HANDLERS ====================
     
-    # Document handlers (PDF, CSV, JSON)
-    application.add_handler(MessageHandler(filters.Document.PDF, bot_handlers.handle_document))
-    application.add_handler(MessageHandler(filters.Document.CSV, bot_handlers.handle_document))
-    application.add_handler(MessageHandler(filters.Document.FileExtension("json"), bot_handlers.handle_document))
-    application.add_handler(MessageHandler(filters.Document.ALL, bot_handlers.handle_document))
+    # Document handlers - FIXED: Use FileExtension instead of non-existent attributes
+    application.add_handler(MessageHandler(
+        filters.Document.PDF, 
+        bot_handlers.handle_document
+    ))
+    
+    application.add_handler(MessageHandler(
+        filters.Document.FileExtension("csv"), 
+        bot_handlers.handle_document
+    ))
+    
+    application.add_handler(MessageHandler(
+        filters.Document.FileExtension("json"), 
+        bot_handlers.handle_document
+    ))
+    
+    # Catch-all for other documents
+    application.add_handler(MessageHandler(
+        filters.Document.ALL, 
+        bot_handlers.handle_document
+    ))
     
     # Photo handler
-    application.add_handler(MessageHandler(filters.PHOTO, bot_handlers.handle_photo))
+    application.add_handler(MessageHandler(
+        filters.PHOTO, 
+        bot_handlers.handle_photo
+    ))
     
     # Poll handler
-    application.add_handler(MessageHandler(filters.POLL, bot_handlers.handle_poll))
+    application.add_handler(MessageHandler(
+        filters.POLL, 
+        bot_handlers.handle_poll
+    ))
     
-    # Text handler (for callbacks)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, callback_handlers.handle_text))
+    # Text handler (for callbacks) - must be last
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        callback_handlers.handle_text
+    ))
     
     # ==================== OTHER HANDLERS ====================
     
