@@ -1,7 +1,8 @@
 python-telegram-bot
 google-genai
-pdf2image
+pdf2imag
 Pillow
 pymongo
-weasyprint
-reportlab
+selenium
+webdriver-manager
+jinja2
