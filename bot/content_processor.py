@@ -1,6 +1,6 @@
 """
-Content Processor - Complete with Grid PDF Modes
-Auto-generates CSV, JSON, and 2 Grid-Layout PDFs
+Content Processor - Complete with Selenium PDF Generation
+Auto-generates CSV, JSON, and 2 PDF formats
 """
 
 import json
@@ -251,7 +251,7 @@ class ContentProcessor:
         return normalized
 
     async def auto_generate_files(self, user_id: int, questions: List, timestamp: str, context, progress_msg):
-        """Generate CSV, JSON, and 2 Grid-Layout PDFs"""
+        """Generate CSV, JSON, and 2 PDF formats"""
         
         try:
             # CSV with validation
@@ -321,87 +321,119 @@ class ContentProcessor:
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(json_questions, f, ensure_ascii=False, indent=2)
             
-            # PDF - BOTH GRID MODES
+            # PDF - BOTH FORMATS with Selenium
             await progress_msg.edit_text("📦 CSV ✓\n📦 JSON ✓\n📦 **Generating PDFs...**")
             
             from processors.pdf_exporter import pdf_exporter
             
             pdf_title = f"Quiz_{timestamp}"
             
-            # Mode 1: Grid with answer boxes
-            pdf_path_mode1 = config.OUTPUT_DIR / f"questions_{timestamp}_mode1.pdf"
-            cleaned = pdf_exporter.cleanup_questions(questions)
-            pdf_exporter.generate_beautiful_pdf(cleaned, pdf_path_mode1, pdf_title, mode='mode1')
-            
-            # Mode 2: Grid with highlighted answers
-            pdf_path_mode2 = config.OUTPUT_DIR / f"questions_{timestamp}_mode2.pdf"
-            pdf_exporter.generate_beautiful_pdf(cleaned, pdf_path_mode2, pdf_title, mode='mode2')
-            
-            # Send files
-            await progress_msg.edit_text("📦 **Sending files...**")
-            
-            # CSV
-            with open(csv_path, 'rb') as f:
-                await context.bot.send_document(
-                    user_id, f,
-                    filename=f"questions_{timestamp}.csv",
-                    caption="📊 **CSV File**"
+            try:
+                # Generate both PDFs
+                pdf1_path, pdf2_path = await pdf_exporter.generate_both_pdfs(
+                    questions, config.OUTPUT_DIR, pdf_title
                 )
-            
-            # JSON
-            with open(json_path, 'rb') as f:
-                await context.bot.send_document(
-                    user_id, f,
-                    filename=f"questions_{timestamp}.json",
-                    caption="📋 **JSON File**"
+                
+                # Send files
+                await progress_msg.edit_text("📦 **Sending files...**")
+                
+                # CSV
+                with open(csv_path, 'rb') as f:
+                    await context.bot.send_document(
+                        user_id, f,
+                        filename=f"questions_{timestamp}.csv",
+                        caption="📊 **CSV File**"
+                    )
+                
+                # JSON
+                with open(json_path, 'rb') as f:
+                    await context.bot.send_document(
+                        user_id, f,
+                        filename=f"questions_{timestamp}.json",
+                        caption="📋 **JSON File**"
+                    )
+                
+                # PDF Format 1 - Practice Sheet
+                with open(pdf1_path, 'rb') as f:
+                    await context.bot.send_document(
+                        user_id, f,
+                        filename=f"{pdf_title}_PracticeSheet.pdf",
+                        caption=f"📄 **Format 1** • Practice Sheet with Answers • {len(questions)}Q"
+                    )
+                
+                # PDF Format 2 - Questions & Answers Separate
+                with open(pdf2_path, 'rb') as f:
+                    await context.bot.send_document(
+                        user_id, f,
+                        filename=f"{pdf_title}_QuestionsAnswers.pdf",
+                        caption=f"📄 **Format 2** • Questions then Answer Table • {len(questions)}Q"
+                    )
+                
+                # Action buttons
+                session_id = self.bot_handlers.user_states[user_id]['session_id']
+                
+                keyboard = [
+                    [InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")],
+                    [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")]
+                ]
+                
+                await context.bot.send_message(
+                    user_id,
+                    f"✅ **All Files Generated**\n\n"
+                    f"• CSV: Questions data\n"
+                    f"• JSON: Structured format\n"
+                    f"• PDF Format 1: Practice sheet\n"
+                    f"• PDF Format 2: Q&A separate\n\n"
+                    f"Choose action:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
                 )
-            
-            # PDF Mode 1
-            with open(pdf_path_mode1, 'rb') as f:
-                await context.bot.send_document(
-                    user_id, f,
-                    filename=f"{pdf_title}_GridAnswers.pdf",
-                    caption=f"📄 **PDF Mode 1** • Grid with Answer Boxes • {len(questions)}Q"
-                )
-            
-            # PDF Mode 2
-            with open(pdf_path_mode2, 'rb') as f:
-                await context.bot.send_document(
-                    user_id, f,
-                    filename=f"{pdf_title}_GridHighlighted.pdf",
-                    caption=f"📝 **PDF Mode 2** • Grid with Highlighted Answers • {len(questions)}Q"
-                )
-            
-            # Action buttons
-            session_id = self.bot_handlers.user_states[user_id]['session_id']
-            
-            keyboard = [
-                [InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")],
-                [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")]
-            ]
-            
-            await context.bot.send_message(
-                user_id,
-                f"✅ **All Files Generated**\n\n"
-                f"• CSV: Questions data\n"
-                f"• JSON: Structured format\n"
-                f"• PDF Mode 1: Answer boxes\n"
-                f"• PDF Mode 2: Highlighted answers\n\n"
-                f"Choose action:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-            
-            # Cleanup
-            csv_path.unlink(missing_ok=True)
-            json_path.unlink(missing_ok=True)
-            pdf_path_mode1.unlink(missing_ok=True)
-            pdf_path_mode2.unlink(missing_ok=True)
-            
-            # Delete progress message
-            await progress_msg.delete()
-            
-            print(f"✅ All files generated and sent")
+                
+                # Cleanup
+                csv_path.unlink(missing_ok=True)
+                json_path.unlink(missing_ok=True)
+                pdf1_path.unlink(missing_ok=True)
+                pdf2_path.unlink(missing_ok=True)
+                
+                # Delete progress message
+                await progress_msg.delete()
+                
+                print(f"✅ All files generated and sent")
+                
+            except Exception as pdf_error:
+                print(f"❌ PDF generation error: {pdf_error}")
+                import traceback
+                traceback.print_exc()
+                
+                # Still send CSV and JSON if PDF fails
+                try:
+                    with open(csv_path, 'rb') as f:
+                        await context.bot.send_document(
+                            user_id, f,
+                            filename=f"questions_{timestamp}.csv",
+                            caption="📊 **CSV File**"
+                        )
+                    
+                    with open(json_path, 'rb') as f:
+                        await context.bot.send_document(
+                            user_id, f,
+                            filename=f"questions_{timestamp}.json",
+                            caption="📋 **JSON File**"
+                        )
+                    
+                    # Cleanup
+                    csv_path.unlink(missing_ok=True)
+                    json_path.unlink(missing_ok=True)
+                    
+                    await progress_msg.edit_text(
+                        f"⚠️ **PDFs Failed, but CSV/JSON sent**\n\n`{str(pdf_error)[:150]}`",
+                        parse_mode='Markdown'
+                    )
+                except:
+                    await progress_msg.edit_text(
+                        f"❌ **File Generation Error**\n\n`{str(pdf_error)[:150]}`",
+                        parse_mode='Markdown'
+                    )
             
         except Exception as e:
             print(f"❌ File generation error: {e}")
