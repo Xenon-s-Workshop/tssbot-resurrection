@@ -1,6 +1,6 @@
 """
 Bot Handlers - Complete with All Commands
-Includes: start, help, settings, info, queue, cancel, livequiz, authorize, revoke, users, collectpolls, merge, poll handling
+CSV/JSON shows action buttons, /done generates all files
 """
 
 import re
@@ -194,6 +194,25 @@ class BotHandlers:
         """Handle /cancel command"""
         user_id = update.effective_user.id
         
+        # Check poll collector
+        from processors.poll_collector import poll_collector
+        
+        if poll_collector.is_collecting(user_id):
+            poll_collector.stop_collection(user_id)
+            await update.message.reply_text(
+                "❌ **Poll Collection Cancelled**",
+                parse_mode='Markdown'
+            )
+            return
+        
+        if poll_collector.is_merging(user_id):
+            poll_collector.cleanup_merge_session(user_id)
+            await update.message.reply_text(
+                "❌ **Merge Session Cancelled**",
+                parse_mode='Markdown'
+            )
+            return
+        
         # Clear from queue
         task_queue.clear_user(user_id)
         
@@ -231,12 +250,10 @@ class BotHandlers:
         """Handle /authorize command"""
         user_id = update.effective_user.id
         
-        # Check if sudo user
         if user_id not in config.SUDO_USER_IDS:
             await update.message.reply_text("❌ Unauthorized")
             return
         
-        # Parse user ID
         try:
             args = update.message.text.split()
             if len(args) < 2:
@@ -259,12 +276,10 @@ class BotHandlers:
         """Handle /revoke command"""
         user_id = update.effective_user.id
         
-        # Check if sudo user
         if user_id not in config.SUDO_USER_IDS:
             await update.message.reply_text("❌ Unauthorized")
             return
         
-        # Parse user ID
         try:
             args = update.message.text.split()
             if len(args) < 2:
@@ -287,7 +302,6 @@ class BotHandlers:
         """Handle /users command"""
         user_id = update.effective_user.id
         
-        # Check if sudo user
         if user_id not in config.SUDO_USER_IDS:
             await update.message.reply_text("❌ Unauthorized")
             return
@@ -313,7 +327,6 @@ class BotHandlers:
         
         from processors.poll_collector import poll_collector
         
-        # Check if already collecting
         if poll_collector.is_collecting(user_id):
             count = poll_collector.get_poll_count(user_id)
             await update.message.reply_text(
@@ -324,10 +337,8 @@ class BotHandlers:
             )
             return
         
-        # Parse filename
         filename = poll_collector.parse_filename(update.message.text)
         
-        # Start collection
         poll_collector.start_collection(user_id, filename)
         poll_collector.set_chat_id(user_id, update.effective_chat.id)
         
@@ -339,7 +350,7 @@ class BotHandlers:
             f"• /done - Export CSV\n"
             f"• /status - Check progress\n"
             f"• /cancel - Stop collection\n\n"
-            f"Send polls now!",
+            f"**Forward quiz polls now!**",
             parse_mode='Markdown'
         )
     
@@ -350,16 +361,17 @@ class BotHandlers:
         
         from processors.poll_collector import poll_collector
         
-        # Check if collecting
         if not poll_collector.is_collecting(user_id):
             return
         
         poll = update.poll
-        if not poll or poll.type != 'quiz':
-            await update.message.reply_text("❌ Only quiz polls are supported")
+        if not poll:
             return
         
-        # Add poll
+        if poll.correct_option_id is None:
+            await update.message.reply_text("❌ Only quiz polls with correct answers are supported")
+            return
+        
         poll_data = {
             'question': poll.question,
             'options': [opt.text for opt in poll.options],
@@ -368,30 +380,70 @@ class BotHandlers:
         }
         
         poll_collector.add_poll(user_id, poll_data)
+        print(f"✅ Poll added for user {user_id}: {poll.question[:50]}...")
     
     @require_auth
     async def handle_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /done command"""
+        """Handle /done command - prioritize CSV/JSON over poll collection"""
         user_id = update.effective_user.id
+        
+        # PRIORITY 1: CSV/JSON questions - Generate ALL files
+        if user_id in self.user_states and 'questions' in self.user_states[user_id]:
+            await self._handle_csv_json_done(update, context, user_id)
+            return
         
         from processors.poll_collector import poll_collector
         
-        # Check for merge mode
+        # PRIORITY 2: Merge mode
         if poll_collector.is_merging(user_id):
             await self._handle_merge_done(update, context, user_id)
             return
         
-        # Check for collection mode
-        if not poll_collector.is_collecting(user_id):
-            await update.message.reply_text("❌ Not collecting polls. Use /collectpolls to start.")
+        # PRIORITY 3: Poll collection
+        if poll_collector.is_collecting(user_id):
+            await self._handle_poll_collection_done(update, context, user_id)
             return
+        
+        await update.message.reply_text(
+            "❌ No active session\n\n"
+            "Use /collectpolls to collect polls or send a CSV/JSON file",
+            parse_mode='Markdown'
+        )
+    
+    async def _handle_csv_json_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Handle CSV/JSON - Generate ALL files (CSV, JSON, 2 PDFs)"""
+        state = self.user_states[user_id]
+        questions = state['questions']
+        
+        from bot.content_processor import ContentProcessor
+        processor = ContentProcessor(self)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        msg = await update.message.reply_text(
+            "🔄 **Generating All Files...**\n\n"
+            "This will create:\n"
+            "• CSV file\n"
+            "• JSON file\n"
+            "• PDF Format 1 (Practice Sheet)\n"
+            "• PDF Format 2 (Q&A Separate)",
+            parse_mode='Markdown'
+        )
+        
+        try:
+            await processor.auto_generate_files(user_id, questions, timestamp, context, msg)
+        except Exception as e:
+            await msg.edit_text(f"❌ **Error**\n\n`{str(e)[:150]}`", parse_mode='Markdown')
+    
+    async def _handle_poll_collection_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Handle poll collection export"""
+        from processors.poll_collector import poll_collector
         
         user_state = poll_collector.user_states.get(user_id)
         if not user_state:
             await update.message.reply_text("❌ No active session")
             return
         
-        # Cancel pending processing
         if user_state.get('processing_task') and not user_state['processing_task'].done():
             user_state['processing_task'].cancel()
         
@@ -401,12 +453,10 @@ class BotHandlers:
             await update.message.reply_text("❌ No polls collected")
             return
         
-        # Export polls
         try:
             csv_path, count = poll_collector.export_csv(user_id)
             filename = poll_collector.get_filename(user_id)
             
-            # Send CSV
             with open(csv_path, 'rb') as f:
                 await context.bot.send_document(
                     user_id, f,
@@ -414,7 +464,6 @@ class BotHandlers:
                     caption=f"📊 **Poll Collection Complete**\n\n✅ {count} polls exported"
                 )
             
-            # Cleanup
             import os
             os.unlink(csv_path)
             await poll_collector.cleanup_progress_message(
@@ -434,7 +483,6 @@ class BotHandlers:
             
             output_path, file_count = await poll_collector.perform_merge(user_id)
             
-            # Send merged file
             with open(output_path, 'rb') as f:
                 await context.bot.send_document(
                     user_id, f,
@@ -442,7 +490,6 @@ class BotHandlers:
                     caption=f"✅ **Merge Complete**\n\n📁 Files merged: {file_count}"
                 )
             
-            # Cleanup
             import os
             os.unlink(output_path)
             poll_collector.cleanup_merge_session(user_id)
@@ -462,27 +509,25 @@ class BotHandlers:
         if poll_collector.is_merging(user_id):
             count = poll_collector.get_merge_file_count(user_id)
             await update.message.reply_text(
-                f"📁 **Merge Mode**\n\n"
-                f"Files: {count}\n\n"
-                f"Use /done to merge",
+                f"📁 **Merge Mode**\n\nFiles: {count}\n\nUse /done to merge",
                 parse_mode='Markdown'
             )
             return
         
-        if not poll_collector.is_collecting(user_id):
-            await update.message.reply_text("❌ Not collecting polls. Use /collectpolls to start.")
+        if poll_collector.is_collecting(user_id):
+            count = poll_collector.get_poll_count(user_id)
+            filename = poll_collector.get_filename(user_id)
+            
+            await update.message.reply_text(
+                f"📊 **Collection Status**\n\n"
+                f"📁 File: `{filename}`\n"
+                f"✅ Collected: {count} polls\n\n"
+                f"Use /done to export",
+                parse_mode='Markdown'
+            )
             return
         
-        count = poll_collector.get_poll_count(user_id)
-        filename = poll_collector.get_filename(user_id)
-        
-        await update.message.reply_text(
-            f"📊 **Collection Status**\n\n"
-            f"📁 File: `{filename}`\n"
-            f"✅ Collected: {count} polls\n\n"
-            f"Use /done to export",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("❌ No active session", parse_mode='Markdown')
     
     @require_auth
     async def handle_merge(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -491,11 +536,9 @@ class BotHandlers:
         
         from processors.poll_collector import poll_collector
         
-        # Parse filename
         filename_match = re.search(r'"([^"]+)"', update.message.text)
         filename = filename_match.group(1).strip() if filename_match else None
         
-        # Start merge session
         poll_collector.start_merge_session(user_id, filename)
         
         await update.message.reply_text(
@@ -514,7 +557,6 @@ class BotHandlers:
         user_id = update.effective_user.id
         document = update.message.document
         
-        # Check for merge mode
         from processors.poll_collector import poll_collector
         if poll_collector.is_merging(user_id):
             await self._handle_document_for_merge(update, context, user_id, document)
@@ -522,13 +564,10 @@ class BotHandlers:
         
         file_name = document.file_name.lower()
         
-        # Handle CSV
         if file_name.endswith('.csv'):
             await self.handle_csv(update, context)
-        # Handle JSON
         elif file_name.endswith('.json'):
             await self.handle_json(update, context)
-        # Handle PDF
         elif file_name.endswith('.pdf'):
             await self._handle_pdf(update, context, user_id, document)
         else:
@@ -540,7 +579,6 @@ class BotHandlers:
         
         file_name = document.file_name.lower()
         
-        # Determine file type
         if file_name.endswith('.csv'):
             file_type = 'csv'
         elif file_name.endswith('.json'):
@@ -549,12 +587,10 @@ class BotHandlers:
             await update.message.reply_text("❌ Only CSV and JSON files supported")
             return
         
-        # Download file
         file = await context.bot.get_file(document.file_id)
         temp_path = config.OUTPUT_DIR / f"merge_{user_id}_{document.file_id}.{file_type}"
         await file.download_to_drive(temp_path)
         
-        # Add to merge queue
         success = poll_collector.add_merge_file(user_id, str(temp_path), file_type)
         
         if success:
@@ -570,12 +606,10 @@ class BotHandlers:
     
     async def _handle_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, document):
         """Handle PDF document"""
-        # Download PDF
         file = await context.bot.get_file(document.file_id)
         pdf_path = config.TEMP_DIR / f"pdf_{user_id}_{document.file_id}.pdf"
         await file.download_to_drive(pdf_path)
         
-        # Store in user state
         self.user_states[user_id] = {
             'pdf_path': pdf_path,
             'waiting_for': 'page_selection'
@@ -593,51 +627,196 @@ class BotHandlers:
         )
     
     async def handle_csv(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle CSV file"""
+        """Handle CSV file - Show action buttons"""
         user_id = update.effective_user.id
         document = update.message.document
         
-        # Download CSV
         file = await context.bot.get_file(document.file_id)
         csv_path = config.TEMP_DIR / f"csv_{user_id}_{document.file_id}.csv"
         await file.download_to_drive(csv_path)
         
-        # Load CSV (simplified - implement full CSV loading)
-        await update.message.reply_text(
-            "📊 **CSV Loaded**\n\nUse /done to process",
-            parse_mode='Markdown'
-        )
+        try:
+            from processors.csv_processor import CSVProcessor
+            questions = CSVProcessor.csv_to_questions(csv_path)
+            
+            if not questions:
+                await update.message.reply_text("❌ No valid questions found in CSV")
+                csv_path.unlink(missing_ok=True)
+                return
+            
+            normalized = []
+            for q in questions:
+                options = []
+                for i in range(1, 6):
+                    opt = q.get(f'option{i}', '').strip()
+                    if opt:
+                        options.append(opt)
+                
+                if not options or len(options) < 2:
+                    continue
+                
+                try:
+                    answer_idx = int(q.get('answer', 1)) - 1
+                except:
+                    answer_idx = 0
+                
+                if answer_idx < 0 or answer_idx >= len(options):
+                    answer_idx = 0
+                
+                normalized.append({
+                    'question_description': q.get('questions', '').strip(),
+                    'options': options,
+                    'correct_answer_index': answer_idx,
+                    'correct_option': chr(65 + answer_idx),
+                    'explanation': q.get('explanation', '').strip()
+                })
+            
+            if not normalized:
+                await update.message.reply_text("❌ No valid questions after processing")
+                csv_path.unlink(missing_ok=True)
+                return
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_id = f"csv_{user_id}_{timestamp}"
+            
+            self.user_states[user_id] = {
+                'questions': normalized,
+                'session_id': session_id,
+                'source': 'csv'
+            }
+            
+            keyboard = [
+                [InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")],
+                [InlineKeyboardButton("📄 Export PDF", callback_data=f"export_pdf_{session_id}")],
+                [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")]
+            ]
+            
+            await update.message.reply_text(
+                f"📊 **CSV Loaded**\n\n"
+                f"✅ {len(normalized)} questions ready\n\n"
+                f"**Choose action:**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            
+            csv_path.unlink(missing_ok=True)
+            
+        except Exception as e:
+            print(f"❌ CSV processing error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            await update.message.reply_text(
+                f"❌ **CSV Error**\n\n`{str(e)[:150]}`",
+                parse_mode='Markdown'
+            )
+            csv_path.unlink(missing_ok=True)
     
     async def handle_json(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle JSON file"""
+        """Handle JSON file - Show action buttons"""
         user_id = update.effective_user.id
         document = update.message.document
         
-        # Download JSON
         file = await context.bot.get_file(document.file_id)
         json_path = config.TEMP_DIR / f"json_{user_id}_{document.file_id}.json"
         await file.download_to_drive(json_path)
         
-        # Load JSON (simplified - implement full JSON loading)
-        await update.message.reply_text(
-            "📋 **JSON Loaded**\n\nUse /done to process",
-            parse_mode='Markdown'
-        )
+        try:
+            import json
+            with open(json_path, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+            
+            if isinstance(json_data, dict):
+                json_data = [json_data]
+            
+            normalized = []
+            for q in json_data:
+                if not isinstance(q, dict):
+                    continue
+                
+                question_text = q.get('question', '').strip()
+                
+                options_data = q.get('options', {})
+                options = []
+                
+                if isinstance(options_data, dict):
+                    for letter in ['A', 'B', 'C', 'D', 'E', 'F']:
+                        opt = options_data.get(letter)
+                        if opt:
+                            options.append(opt)
+                elif isinstance(options_data, list):
+                    options = options_data
+                
+                if not question_text or len(options) < 2:
+                    continue
+                
+                correct_answer = q.get('correct_answer', 'A').upper()
+                correct_idx = ord(correct_answer) - ord('A')
+                
+                if correct_idx < 0 or correct_idx >= len(options):
+                    correct_idx = 0
+                    correct_answer = 'A'
+                
+                normalized.append({
+                    'question_description': question_text,
+                    'options': options,
+                    'correct_answer_index': correct_idx,
+                    'correct_option': correct_answer,
+                    'explanation': q.get('explanation', '').strip()
+                })
+            
+            if not normalized:
+                await update.message.reply_text("❌ No valid questions in JSON")
+                json_path.unlink(missing_ok=True)
+                return
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_id = f"json_{user_id}_{timestamp}"
+            
+            self.user_states[user_id] = {
+                'questions': normalized,
+                'session_id': session_id,
+                'source': 'json'
+            }
+            
+            keyboard = [
+                [InlineKeyboardButton("📢 Post Quizzes", callback_data=f"post_{session_id}")],
+                [InlineKeyboardButton("📄 Export PDF", callback_data=f"export_pdf_{session_id}")],
+                [InlineKeyboardButton("🎯 Live Quiz", callback_data=f"livequiz_{session_id}")]
+            ]
+            
+            await update.message.reply_text(
+                f"📋 **JSON Loaded**\n\n"
+                f"✅ {len(normalized)} questions ready\n\n"
+                f"**Choose action:**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            
+            json_path.unlink(missing_ok=True)
+            
+        except Exception as e:
+            print(f"❌ JSON processing error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            await update.message.reply_text(
+                f"❌ **JSON Error**\n\n`{str(e)[:150]}`",
+                parse_mode='Markdown'
+            )
+            json_path.unlink(missing_ok=True)
     
     @require_auth
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle photo uploads"""
         user_id = update.effective_user.id
         
-        # Get largest photo
         photo = update.message.photo[-1]
         
-        # Download photo
         file = await context.bot.get_file(photo.file_id)
         photo_path = config.TEMP_DIR / f"photo_{user_id}_{photo.file_id}.jpg"
         await file.download_to_drive(photo_path)
         
-        # Initialize or append to user state
         if user_id not in self.user_states:
             self.user_states[user_id] = {'photos': []}
         
@@ -680,7 +859,6 @@ class BotHandlers:
     async def process_queued_task(self, user_id: int, state: dict, context):
         """Process queued task"""
         try:
-            # Get content paths
             if 'pdf_path' in state:
                 content_paths = [state['pdf_path']]
                 content_type = 'pdf'
@@ -693,7 +871,6 @@ class BotHandlers:
             page_range = state.get('page_range')
             mode = state.get('mode', 'extraction')
             
-            # Process content
             from bot.content_processor import ContentProcessor
             processor = ContentProcessor(self)
             
